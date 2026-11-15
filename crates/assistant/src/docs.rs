@@ -42,6 +42,8 @@ pub const PAGES: &[Page] = pages![
     "comparison/index.md",
     "comparison/geolibre.md",
     "comparison/qgis.md",
+    // Off the site's navigation, but on the site.
+    "geolibre-parity.md",
     "cli.md",
     "python.md",
     "mcp.md",
