@@ -41,6 +41,34 @@ fn elements<'a, 'i>(n: &Node<'a, 'i>, name: &'static str) -> impl Iterator<Item 
     n.descendants().filter(move |c| c.is_element() && local(c) == name)
 }
 
+/// Direct `<P>` and `<F>` descendants of `s`, stopping at any nested `<Surface>` so each surface
+/// keeps its own point-ID namespace and every node is visited once even under deep nesting.
+fn surface_nodes<'a, 'i>(s: &Node<'a, 'i>) -> Result<(Vec<Node<'a, 'i>>, Vec<Node<'a, 'i>>)> {
+    let (mut pts, mut fcs) = (Vec::new(), Vec::new());
+    let mut stack: Vec<Node<'a, 'i>> = s.children().collect();
+    stack.reverse();
+    let mut visited = 0usize;
+    while let Some(node) = stack.pop() {
+        if visited.is_multiple_of(1024) {
+            crate::progress::check()?;
+        }
+        visited += 1;
+        if !node.is_element() {
+            continue;
+        }
+        match local(&node) {
+            "Surface" => continue,
+            "P" => pts.push(node),
+            "F" => fcs.push(node),
+            _ => {}
+        }
+        let mut children: Vec<Node<'a, 'i>> = node.children().collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    Ok((pts, fcs))
+}
+
 fn text_of(n: &Node) -> String {
     n.children().filter(|t| t.is_text()).filter_map(|t| t.text()).collect::<String>()
 }
@@ -205,15 +233,11 @@ fn read_with_max_faces(file_name: &str, bytes: &[u8], crs: Option<Crs>, max_face
     let mut faces_left_out = 0usize;
     let mut total_faces = 0usize;
     for s in elements(&root, "Surface") {
-        // Nested `<Surface>` elements would revisit every descendant `<P>` and `<F>`, multiplying
-        // work and face counts quadratically.
-        if s.ancestors().skip(1).any(|a| a.is_element() && local(&a) == "Surface") {
-            continue;
-        }
         crate::progress::check()?;
         let sname = s.attribute("name").unwrap_or("").to_string();
+        let (surf_pts, surf_faces) = surface_nodes(&s)?;
         let mut pnts: HashMap<&str, (Coord, Option<f64>)> = HashMap::new();
-        for (pi, p) in elements(&s, "P").enumerate() {
+        for (pi, p) in surf_pts.into_iter().enumerate() {
             if pi.is_multiple_of(1024) {
                 crate::progress::check()?;
             }
@@ -229,7 +253,7 @@ fn read_with_max_faces(file_name: &str, bytes: &[u8], crs: Option<Crs>, max_face
         // Invisible faces (i="1") are holes in the surface, never read, so the cap counts the
         // faces that are.
         let mut s_over_limit = false;
-        for (fi, f) in elements(&s, "F").filter(|f| f.attribute("i") != Some("1")).enumerate() {
+        for (fi, f) in surf_faces.into_iter().filter(|f| f.attribute("i") != Some("1")).enumerate() {
             if fi.is_multiple_of(1024) {
                 crate::progress::check()?;
             }
@@ -497,9 +521,15 @@ mod tests {
     fn nested_surfaces_do_not_multiply_faces_and_cap_is_file_wide() {
         let nested = r#"<LandXML><CoordinateSystem epsgCode="4326"/><Surfaces>
             <Surface name="outer">
-                <Surface name="inner">
+                <Surface name="inner_a">
                     <Definition surfType="TIN">
                         <Pnts><P id="1">0 0 1</P><P id="2">0 1 1</P><P id="3">1 0 1</P></Pnts>
+                        <Faces><F>1 2 3</F></Faces>
+                    </Definition>
+                </Surface>
+                <Surface name="inner_b">
+                    <Definition surfType="TIN">
+                        <Pnts><P id="1">10 10 5</P><P id="2">10 11 5</P><P id="3">11 10 5</P></Pnts>
                         <Faces><F>1 2 3</F></Faces>
                     </Definition>
                 </Surface>
@@ -507,7 +537,29 @@ mod tests {
         </Surfaces></LandXML>"#;
         let layers = read("nested.xml", nested.as_bytes(), None).unwrap();
         assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].0.features.len(), 1, "nested <Surface> must not duplicate faces");
+        assert_eq!(layers[0].0.features.len(), 2, "nested <Surface> elements must not duplicate faces");
+        assert_eq!(layers[0].0.value(0, 0), &Value::Text("inner_a".into()));
+        assert_eq!(layers[0].0.value(0, 1), &Value::Float(1.0));
+        assert_eq!(layers[0].0.value(1, 0), &Value::Text("inner_b".into()));
+        assert_eq!(layers[0].0.value(1, 1), &Value::Float(5.0));
+        assert_eq!(
+            layers[0].0.features[0].geometry,
+            Some(Geometry::Polygon(vec![vec![vec![
+                Coord::new(0.0, 0.0),
+                Coord::new(1.0, 0.0),
+                Coord::new(0.0, 1.0),
+                Coord::new(0.0, 0.0),
+            ]]]))
+        );
+        assert_eq!(
+            layers[0].0.features[1].geometry,
+            Some(Geometry::Polygon(vec![vec![vec![
+                Coord::new(10.0, 10.0),
+                Coord::new(11.0, 10.0),
+                Coord::new(10.0, 11.0),
+                Coord::new(10.0, 10.0),
+            ]]]))
+        );
 
         let two_surfaces = r#"<LandXML><CoordinateSystem epsgCode="4326"/><Surfaces>
             <Surface name="a"><Definition surfType="TIN">

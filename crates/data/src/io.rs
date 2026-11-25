@@ -2779,7 +2779,7 @@ fn read_csv_records(
         || DataError::Format(format!("CSV retained table exceeds the {allowance}-byte remaining memory budget; import a smaller file"));
     let header = reader.headers().map_err(refused)?;
     let mut left = budget.checked_sub(cost(header, header.len())).ok_or_else(too_large)?;
-    let headers: Vec<String> = header.iter().map(unguard_header).collect();
+    let headers: Vec<String> = header.iter().map(str::to_string).collect();
     let mut malformed = 0;
     let mut rows = Vec::new();
     for record in reader.records() {
@@ -3269,7 +3269,7 @@ const FORMULA_START: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 /// Text needs an apostrophe if it starts like a spreadsheet formula. The numeric exception
 /// keeps finite numbers that fit Double precision and have at most 15 significant digits.
 /// A leading-zero code stays guarded unless its mantissa has digits after a decimal point.
-fn csv_needs_guard(text: &str) -> bool {
+pub(crate) fn csv_needs_guard(text: &str) -> bool {
     if !text.starts_with(FORMULA_START) {
         return false;
     }
@@ -3286,21 +3286,6 @@ pub(crate) fn csv_cell(v: &Value) -> String {
     match v {
         Value::Text(t) if csv_needs_guard(t) => format!("'{t}"),
         other => other.to_file_text(),
-    }
-}
-
-/// A CSV header name, prefixed with an apostrophe when it starts like a spreadsheet formula
-/// (or starts with apostrophes before one, so [`unguard_header`] reverses it losslessly).
-pub(crate) fn csv_header(name: &str) -> String {
-    if csv_needs_guard(name.trim_start_matches('\'')) { format!("'{name}") } else { name.to_string() }
-}
-
-/// Reverses [`csv_header`]: strips one leading apostrophe only when what follows would be guarded
-/// on export, so literal leading apostrophes round-trip unchanged.
-fn unguard_header(header: &str) -> String {
-    match header.strip_prefix('\'') {
-        Some(rest) if csv_needs_guard(rest.trim_start_matches('\'')) => rest.to_string(),
-        _ => header.to_string(),
     }
 }
 
@@ -3367,7 +3352,7 @@ impl<W: std::io::Write> CsvWriter<W> {
             // The coordinate columns come first, before any attributes using recognised names.
             head.extend(csv_names_in(fields, crs));
         }
-        head.extend(fields.iter().map(|f| csv_header(&f.name)));
+        head.extend(fields.iter().map(|f| f.name.clone()));
         w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
         Ok(CsvWriter { w, point })
     }

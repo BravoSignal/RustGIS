@@ -528,7 +528,8 @@ pub fn to_wkt_csv(ds: &Dataset) -> crate::Result<String> {
     let mut out = String::from("wkt");
     for f in &ds.fields {
         out.push(',');
-        out.push_str(&q(&crate::io::csv_header(&f.name)));
+        let name = if crate::io::csv_needs_guard(&f.name) { format!("'{}", f.name) } else { f.name.clone() };
+        out.push_str(&q(&name));
     }
     out.push('\n');
     for f in &ds.features {
@@ -611,9 +612,9 @@ mod tests {
         for plain in ["-12.5", "+42", "-0.5", "Paris"] {
             assert_eq!(crate::io::csv_cell(&Value::Text(plain.into())), plain, "{plain:?}");
         }
-        // Round-trip: formula-like headers (`=1+1`, `=HYPERLINK(...)`, `+0123`) and literal
-        // leading-apostrophe headers (`'=1+1`, `'note`) are guarded on export and restored on
-        // read; 16-digit negative integers stay Integer; formula-like text cells stay guarded.
+        // Formula-like headers (`=1+1`, `=HYPERLINK(...)`, `\t=1`, `+0123`) are apostrophe-guarded
+        // on export; 16-digit negative integers stay unguarded and round-trip as Integer; formula-
+        // like text cells are guarded on export and unguarded on read.
         let mut ds = Dataset::new(
             "rt",
             GeometryType::Point,
@@ -621,32 +622,29 @@ mod tests {
                 Field::new("=1+1", FieldType::Text),
                 Field::new("=HYPERLINK(\"https://example.com\",\"x\")", FieldType::Text),
                 Field::new("+0123", FieldType::Text),
-                Field::new("'=1+1", FieldType::Text),
-                Field::new("'note", FieldType::Text),
                 Field::new("big_id", FieldType::Integer),
             ],
         );
         ds.push(
             Some(Geometry::Point(Coord::new(1.0, 2.0))),
-            vec![
-                Value::Text("\t=1".into()),
-                Value::Text("ok".into()),
-                Value::Text("+0123".into()),
-                Value::Text("a".into()),
-                Value::Text("b".into()),
-                Value::Int(-1_234_567_890_123_456),
-            ],
+            vec![Value::Text("\t=1".into()), Value::Text("ok".into()), Value::Text("+0123".into()), Value::Int(-1_234_567_890_123_456)],
         );
         let csv = to_wkt_csv(&ds).unwrap();
         let header_line = csv.lines().next().unwrap_or("");
-        assert_eq!(header_line, "wkt,'=1+1,\"'=HYPERLINK(\"\"https://example.com\"\",\"\"x\"\")\",'+0123,''=1+1,'note,big_id");
-        assert!(csv.contains("'\t=1,ok,'+0123,a,b,-1234567890123456\n"), "text guarded, integer unguarded: {csv}");
+        assert_eq!(header_line, "wkt,'=1+1,\"'=HYPERLINK(\"\"https://example.com\"\",\"\"x\"\")\",'+0123,big_id");
+        assert!(csv.contains("'\t=1,ok,'+0123,-1234567890123456\n"), "text guarded, integer unguarded: {csv}");
         let (back, _) = crate::io::read_csv(&csv, "rt").unwrap();
-        let names: Vec<&str> = back.fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["=1+1", "=HYPERLINK(\"https://example.com\",\"x\")", "+0123", "'=1+1", "'note", "big_id"]);
-        assert_eq!(back.fields[5].ty, FieldType::Integer);
+        assert_eq!(back.fields[3].ty, FieldType::Integer);
         assert_eq!(back.features[0].attrs[0], Value::Text("\t=1".into()));
         assert_eq!(back.features[0].attrs[2], Value::Text("+0123".into()));
-        assert_eq!(back.features[0].attrs[5], Value::Int(-1_234_567_890_123_456));
+        assert_eq!(back.features[0].attrs[3], Value::Int(-1_234_567_890_123_456));
+
+        // External CSVs whose headers literally start with an apostrophe keep their exact names
+        // and still match explicit `CsvOptions.wkt`.
+        let external = "'=geom,'-foo\nPOINT (1 2),bar\n";
+        let opts = crate::io::CsvOptions { wkt: Some("'=geom".into()), ..Default::default() };
+        let (ext, _) = crate::io::read_csv_with(external, "ext", &opts).unwrap();
+        assert_eq!(ext.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["'-foo"]);
+        assert_eq!(ext.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 2.0))));
     }
 }
