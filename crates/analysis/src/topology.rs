@@ -219,10 +219,10 @@ fn self_crossing(path: &[Coord], closed: bool) -> Result<Option<Coord>, Coord> {
     let n = segs.len();
     let minx = |s: &(Coord, Coord)| s.0.x.min(s.1.x);
     let maxx = |s: &(Coord, Coord)| s.0.x.max(s.1.x);
-    let mut order: Vec<usize> = (0..n).collect();
+    let mut order: Vec<usize> = (0..n).filter(|&i| segs.get(i).is_some_and(|s| s.0.is_finite() && s.1.is_finite())).collect();
     order.sort_by(|a, b| {
         let (sa, sb) = (segs.get(*a).map_or(0.0, minx), segs.get(*b).map_or(0.0, minx));
-        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        sa.total_cmp(&sb)
     });
     let mut work = 0usize;
     for (k, &i) in order.iter().enumerate() {
@@ -234,7 +234,7 @@ fn self_crossing(path: &[Coord], closed: bool) -> Result<Option<Coord>, Coord> {
             }
             work += 1;
             if past_limit(work) {
-                return Err(path.first().copied().unwrap_or(a.0));
+                return Err(path.iter().copied().find(|c| c.is_finite()).unwrap_or(a.0));
             }
             let (lo, hi) = (i.min(j), i.max(j));
             // Neighbouring segments share a vertex, as do a ring's first and last.
@@ -1682,5 +1682,36 @@ mod tests {
         // (on a boundary, which the guide says is still reported), in the gap, east of everything
         // and west of everything: reported.
         assert_eq!(reported, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn self_intersections_handles_non_finite_coords_without_panicking() {
+        // Non-monotonic x coordinates mixed with consecutive NaN vertices (so segment minx is NaN)
+        // trigger driftsort total-order panics under `partial_cmp().unwrap_or(Equal)`.
+        let mut path = Vec::new();
+        for i in 0..80 {
+            let x = ((i * 37) % 80) as f64 * 0.01;
+            if i % 5 == 0 {
+                path.push(Coord::new(f64::NAN, 0.0));
+                path.push(Coord::new(f64::NAN, 0.0));
+            } else {
+                path.push(Coord::new(x, i as f64 * 0.01));
+            }
+        }
+        let mut clean = Dataset::new("l", GeometryType::Polyline, vec![]);
+        clean.push(Some(Geometry::Line(vec![path.clone()])), vec![]);
+        assert!(self_intersections(&clean, &[0]).errors.is_empty());
+
+        // Add a genuine self-crossing among the finite segments.
+        path.push(Coord::new(f64::NAN, f64::NAN));
+        path.push(Coord::new(5.0, 0.0));
+        path.push(Coord::new(5.1, 0.1));
+        path.push(Coord::new(5.1, 0.0));
+        path.push(Coord::new(5.0, 0.1));
+        let mut crossing = Dataset::new("l", GeometryType::Polyline, vec![]);
+        crossing.push(Some(Geometry::Line(vec![path])), vec![]);
+        let res = self_intersections(&crossing, &[0]);
+        assert_eq!(res.errors.len(), 1);
+        assert!((res.errors[0].at.x - 5.05).abs() < 1e-4);
     }
 }

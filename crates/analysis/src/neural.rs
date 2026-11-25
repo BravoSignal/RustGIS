@@ -106,22 +106,46 @@ impl Mlp {
         a
     }
 
-    /// The most likely class (0-based) and its probability.
-    pub fn predict(&self, x: &[f32]) -> (usize, f32) {
+    /// The most likely class (0-based) and its probability, or `None` when the pixel's values
+    /// overflowed the network and produced non-finite probabilities.
+    pub fn predict_checked(&self, x: &[f32]) -> Option<(usize, f32)> {
         let p = self.probabilities(x);
-        p.iter().enumerate().fold((0, f32::MIN), |best, (i, v)| if *v > best.1 { (i, *v) } else { best })
+        if p.is_empty() || !p.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let mut best = (0, f32::NEG_INFINITY);
+        for (i, &v) in p.iter().enumerate() {
+            if v > best.1 {
+                best = (i, v);
+            }
+        }
+        Some(best)
+    }
+
+    /// The most likely class (0-based) and its probability (`(0, NaN)` when non-finite).
+    pub fn predict(&self, x: &[f32]) -> (usize, f32) {
+        self.predict_checked(x).unwrap_or((0, f32::NAN))
     }
 }
 
 fn softmax(a: &mut [f32]) {
-    let m = a.iter().copied().fold(f32::MIN, f32::max);
+    if a.is_empty() {
+        return;
+    }
+    if a.iter().any(|v| !v.is_finite()) {
+        a.fill(f32::NAN);
+        return;
+    }
+    let m = a.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for v in a.iter_mut() {
         *v = (*v - m).exp();
         sum += *v;
     }
-    if sum > 0.0 {
+    if sum > 0.0 && sum.is_finite() {
         a.iter_mut().for_each(|v| *v /= sum);
+    } else {
+        a.fill(f32::NAN);
     }
 }
 
@@ -306,17 +330,25 @@ pub fn train(
     if samples.len() < 2 * k {
         return Err("too few training pixels: draw larger training polygons".into());
     }
-    // Input scaling from the samples.
-    let mut mean = vec![0.0f32; n_in];
-    let mut std = vec![0.0f32; n_in];
+    // Input scaling from the samples, accumulated in f64 so large finite f32 values don't overflow.
+    let mut mean64 = vec![0.0f64; n_in];
+    let mut var64 = vec![0.0f64; n_in];
+    let n_samples = samples.len() as f64;
     for (x, _) in &samples {
-        mean.iter_mut().zip(x).for_each(|(m, v)| *m += v);
+        mean64.iter_mut().zip(x).for_each(|(m, v)| *m += f64::from(*v));
     }
-    mean.iter_mut().for_each(|m| *m /= samples.len() as f32);
+    mean64.iter_mut().for_each(|m| *m /= n_samples);
     for (x, _) in &samples {
-        std.iter_mut().zip(x.iter().zip(&mean)).for_each(|(s, (v, m))| *s += (v - m) * (v - m));
+        var64.iter_mut().zip(x.iter().zip(&mean64)).for_each(|(s, (v, m))| {
+            let d = f64::from(*v) - m;
+            *s += d * d;
+        });
     }
-    std.iter_mut().for_each(|s| *s = (*s / samples.len() as f32).sqrt().max(1e-6));
+    let mean: Vec<f32> = mean64.iter().map(|m| *m as f32).collect();
+    let std: Vec<f32> = var64.iter().map(|s| ((s / n_samples).sqrt() as f32).max(1e-6)).collect();
+    if !mean.iter().chain(&std).all(|v| v.is_finite()) || std.iter().any(|s| *s <= 0.0) {
+        return Err("training values are out of range to scale".into());
+    }
     // Layers, He-initialised.
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut sizes = vec![n_in];
@@ -443,11 +475,12 @@ pub fn train(
     }
     // A cancelled run makes no model: the accuracy check on held-back samples can take long too.
     crate::control::check()?;
-    if !layers.iter().all(|l| l.w.iter().chain(&l.b).all(|v| v.is_finite())) {
+    if !mean.iter().chain(&std).all(|v| v.is_finite()) || !layers.iter().all(|l| l.w.iter().chain(&l.b).all(|v| v.is_finite())) {
         return Err("training diverged; try fewer epochs or smaller layers".into());
     }
     let model = Mlp { bands: bands.to_vec(), mean, std, layers, classes };
-    let correct = test.iter().filter(|&&i| samples.get(i).is_some_and(|(x, c)| model.predict(x).0 == *c)).count();
+    let correct =
+        test.iter().filter(|&&i| samples.get(i).is_some_and(|(x, c)| model.predict_checked(x).is_some_and(|(p, _)| p == *c))).count();
     let accuracy = if test.is_empty() { 1.0 } else { correct as f64 / test.len() as f64 };
     Ok(Trained { model, accuracy, samples: samples.len(), epochs, epochs_asked, fitted: fit.len(), training })
 }
@@ -503,8 +536,7 @@ fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> 
                         None => false,
                     }
                 });
-                if ok {
-                    let (c, p) = model.predict(x);
+                if ok && let Some((c, p)) = model.predict_checked(x) {
                     (*c_out, *p_out) = ((c + 1) as f32, p);
                 }
             }
@@ -656,5 +688,43 @@ mod tests {
         let whole = crate::run_under("Train", &control, || train(&[0, 1], vec!["out".into(), "in".into()], &samples, &[8], 3)).unwrap();
         assert_eq!((whole.fitted, whole.epochs, whole.limited()), (whole.training, 3, None));
         assert!(train(&[0, 1], vec!["a".into(), "b".into()], &samples[..2], &[4], 1).is_err(), "too few");
+    }
+
+    #[test]
+    fn large_scale_training_and_overflowing_inference_stay_finite() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+        // Large finite f32 samples overflow `(v - m) * (v - m)` if variance is summed in f32.
+        let mut samples = Vec::new();
+        for i in 0..40 {
+            let class = usize::from(i >= 20);
+            let base = if class == 0 { 1.0e25f32 } else { 2.0e25f32 };
+            samples.push((vec![base + (i % 5) as f32 * 1.0e23f32], class));
+        }
+        let trained = train(&[0], vec!["low".into(), "high".into()], &samples, &[4], 30).unwrap();
+        trained.model.validate().unwrap();
+        assert!(trained.model.mean.iter().all(|v| v.is_finite()));
+        assert!(trained.model.std.iter().all(|v| v.is_finite() && *v > 0.0));
+        assert_eq!(trained.model.predict(&[1.0e25]).0, 0);
+        assert_eq!(trained.model.predict(&[2.0e25]).0, 1);
+
+        // An extreme finite pixel overflowing logits to +/-inf must stay nodata rather than
+        // writing a bogus class or f32::MIN probability.
+        let model = Mlp {
+            bands: vec![0],
+            mean: vec![0.0],
+            std: vec![1.0],
+            layers: vec![Dense { inp: 1, out: 2, w: vec![10.0, -10.0], b: vec![0.0, 0.0] }],
+            classes: vec!["a".into(), "b".into()],
+        };
+        model.validate().unwrap();
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new("img", 2, 1, vec![vec![1.0, 1.0e38]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let (class, prob) = classify(&r, &model, -1.0).unwrap();
+        assert_eq!(model.predict_checked(&[1.0e38]), None);
+        assert!(model.predict(&[1.0e38]).1.is_nan());
+        assert_eq!(class[0], 1.0);
+        assert!(prob[0] > 0.9 && prob[0].is_finite());
+        assert_eq!(class[1], -1.0, "overflowing pixel stays nodata, got class {} prob {}", class[1], prob[1]);
+        assert_eq!(prob[1], -1.0, "overflowing pixel stays nodata, got prob {}", prob[1]);
     }
 }
