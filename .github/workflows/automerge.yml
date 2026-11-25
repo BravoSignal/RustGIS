@@ -78,13 +78,6 @@ jobs:
           ACTION: ${{ github.event.action }}
         run: |
           set -euo pipefail
-          if [ "$ACTION" = unlabeled ]; then
-            has_label=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER" --jq 'any(.labels[]; .name == "automerge")')
-            if [ "$has_label" = true ]; then
-              echo "automerge label was re-added before revoking; skipping."
-              exit 0
-            fi
-          fi
           gh pr merge "$PR" --disable-auto || echo "Auto-merge was off."
           if [ "$ACTION" = synchronize ]; then
             gh pr edit "$PR" --remove-label automerge
