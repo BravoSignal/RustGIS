@@ -236,12 +236,19 @@ impl Session {
     }
 }
 
-/// The most JSON nodes inspected when scanning a plugin command's parameters for web addresses.
+/// The most string, object, and non-primitive array nodes inspected when scanning a plugin
+/// command's parameters for web addresses.
 const MAX_ADDRESS_SCAN_NODES: usize = 4096;
 
+/// The most total array elements scanned across nested arrays (including pure-primitive coordinate
+/// lists) so hostile gigantic payloads still fail closed.
+const MAX_ADDRESS_SCAN_ELEMENTS: usize = 1_000_000;
+
 /// The web addresses among a command's own parameters, not inside the contents of a file it
-/// gives (`data`, `text`). Walks nested arrays and objects iteratively up to
-/// [`MAX_ADDRESS_SCAN_NODES`] nodes; overly complex parameters are refused rather than skipped.
+/// gives (`data`, `text`). Walks nested arrays and objects iteratively, skipping primitive leaves
+/// and pure-primitive arrays (such as `[x, y]` coordinate pairs) from the
+/// [`MAX_ADDRESS_SCAN_NODES`] count while bounding total scanned array elements at
+/// [`MAX_ADDRESS_SCAN_ELEMENTS`]; overly complex parameters are refused rather than skipped.
 fn web_addresses(params: &Value) -> Result<Vec<&str>, String> {
     let Some(o) = params.as_object() else { return Ok(Vec::new()) };
     let is_primitive = |v: &Value| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null);
@@ -249,9 +256,19 @@ fn web_addresses(params: &Value) -> Result<Vec<&str>, String> {
         o.iter().filter(|(key, v)| !matches!(key.as_str(), "data" | "text") && !is_primitive(v)).map(|(_, v)| v).collect();
     let mut out = Vec::new();
     let mut visited = 0usize;
+    let mut elements = 0usize;
     while let Some(v) = stack.pop() {
         if is_primitive(v) {
             continue;
+        }
+        if let Value::Array(a) = v {
+            elements = elements.saturating_add(a.len());
+            if elements > MAX_ADDRESS_SCAN_ELEMENTS {
+                return Err("command parameters are too complex for a plugin network check".into());
+            }
+            if a.iter().all(is_primitive) {
+                continue;
+            }
         }
         visited += 1;
         if visited > MAX_ADDRESS_SCAN_NODES {

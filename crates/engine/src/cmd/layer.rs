@@ -6109,20 +6109,30 @@ fn add_in_place(
     let fetch_file = crate::service_logins::fetch_url(anonymous, file);
     #[cfg(not(target_arch = "wasm32"))]
     let layer = if strict && s.in_place_wait {
-        rustgis_map::raster::RasterLayer::in_place(cog::raster::overview_blocking(&fetch_file)?, file)
+        rustgis_map::raster::RasterLayer::in_place(cog::raster::overview_blocking(&fetch_file)?, file).with_anonymous(anonymous)
     } else if strict {
-        rustgis_map::raster::RasterLayer::opening_in_place(file)
+        let mut layer = rustgis_map::raster::RasterLayer::unread_in_place(file).with_anonymous(anonymous);
+        let _ = layer.begin_reload();
+        layer
     } else {
-        rustgis_map::raster::RasterLayer::unread_in_place(file)
+        rustgis_map::raster::RasterLayer::unread_in_place(file).with_anonymous(anonymous)
     };
     #[cfg(target_arch = "wasm32")]
     let layer = {
-        let _ = (strict, anonymous);
-        rustgis_map::raster::RasterLayer::opening_in_place(file)
+        let _ = strict;
+        let mut layer = rustgis_map::raster::RasterLayer::unread_in_place(file).with_anonymous(anonymous);
+        let _ = layer.begin_reload();
+        layer
     };
     let layer = layer.with_look(super::tiles::address_look(look));
     let landed = layer.data.is_some();
     let mut r = super::raster::add_raster_after(s, name, layer, zoom)?;
+    if anonymous
+        && let Some(id) = s.active_layer
+        && let Some(l) = s.map_mut().layer_mut(id)
+    {
+        l.anonymous = true;
+    }
     // A header just read (natively) is waited for if something emptied the tile cache since (a
     // login ended): the layer would go unframed. A plugin's command in the app doesn't wait (it
     // runs on the frame), as in the browser.

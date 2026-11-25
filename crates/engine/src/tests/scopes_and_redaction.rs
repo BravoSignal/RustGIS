@@ -985,6 +985,21 @@ fn anonymous_reads_suppress_implicit_s3_and_sign_in_credentials() {
         );
     }
 
+    // 3b. Deferred in-place COG reads marked anonymous must not carry S3 signing headers.
+    {
+        let mut rl =
+            rustgis_map::raster::RasterLayer::unread_in_place(format!("{base}/priv-bkt-anon/deferred-cog.tif")).with_anonymous(true);
+        let _ = rustgis_map::raster::read_together(&mut [&mut rl], true);
+        let cog_reqs = std::mem::take(&mut *seen.lock().unwrap_or_else(|e| e.into_inner()));
+        assert!(!cog_reqs.is_empty(), "deferred in-place COG should issue an HTTP request");
+        for r in &cog_reqs {
+            assert!(
+                !r.contains("AKIA_SYNTH_ANON") && !r.to_ascii_lowercase().contains("authorization:"),
+                "deferred anonymous COG signed with S3 credentials: {r}"
+            );
+        }
+    }
+
     // 4. request_params strips rustgis-s3: capability wrappers under anonymous mode.
     let wrapped = rustgis_data::s3_address::bind("0123456789abcdef", "https://s3.example.org", "s3://priv-bkt-anon/key.geojson").unwrap();
     let p = json!({"url": wrapped});
@@ -1072,13 +1087,18 @@ fn plugin_address_hold_scans_nested_legend_urls_and_bounds_work() {
     forward(&mut s, "plug-net-nested", "map.setTiles", json!({"name": "Base", "legend": [{"url": public_legend}]})).unwrap();
     assert_eq!(cache::ceiling_for(public_legend), Reach::Public);
 
-    // Large numeric arrays do not trip the node limit, while still scanning any strings inside.
-    let mut nums: Vec<Value> = (0..4100).map(|i| json!(i)).collect();
-    forward(&mut s, "plug-net-nested", "map.setTiles", json!({"name": "Base", "legend": [{"url": public_legend}], "extra": nums.clone()}))
-        .unwrap();
-    nums.push(json!("http://127.0.0.1:8080/hidden.png"));
+    // Large numeric and coordinate-pair arrays do not trip the node limit, while still scanning strings inside.
+    let mut coords: Vec<Value> = (0..5000).map(|i| json!([f64::from(i) * 0.01, f64::from(i) * -0.01])).collect();
+    forward(
+        &mut s,
+        "plug-net-nested",
+        "map.setTiles",
+        json!({"name": "Base", "legend": [{"url": public_legend}], "extra": coords.clone()}),
+    )
+    .unwrap();
+    coords.push(json!([0.0, "http://127.0.0.1:8080/hidden.png"]));
     let err =
-        forward(&mut s, "plug-net-nested", "map.addTiles", json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "extra": nums}))
+        forward(&mut s, "plug-net-nested", "map.addTiles", json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "extra": coords}))
             .unwrap_err();
     assert!(err.contains("this computer or the local network"), "{err}");
 
@@ -1205,7 +1225,10 @@ fn project_log_scrubs_active_logins_and_s3_wrappers() {
     assert!(partial, "deeply nested omitted container must mark params partial: {kept_deep}");
 
     // Failed command errors recorded in the session log must also scrub active logins and wrappers.
-    let _ = s.run("layer.rename", &json!({"layer": format!("missing {active_secret} {wrapped}")}));
+    assert!(
+        s.run("layer.rename", &json!({"layer": format!("missing {active_secret} {wrapped}")})).is_err(),
+        "renaming a missing layer must fail to exercise error logging"
+    );
     let entry = s.log.entries().last().unwrap();
     let err = entry.error.as_deref().unwrap_or("");
     assert!(!err.contains(&active_secret), "session log error leaked active login: {err}");
@@ -1214,7 +1237,10 @@ fn project_log_scrubs_active_logins_and_s3_wrappers() {
 
     // An active login spanning the error clip boundary must be scrubbed before truncation.
     let pad = "a".repeat(1985);
-    let _ = s.run("layer.rename", &json!({"layer": format!("{pad}{active_secret}tail")}));
+    assert!(
+        s.run("layer.rename", &json!({"layer": format!("{pad}{active_secret}tail")})).is_err(),
+        "renaming a missing padded layer must fail to exercise clipped error logging"
+    );
     let entry = s.log.entries().last().unwrap();
     let clipped_err = entry.error.as_deref().unwrap_or("");
     assert!(!clipped_err.contains(&active_secret), "clipped error leaked active login: {clipped_err}");
