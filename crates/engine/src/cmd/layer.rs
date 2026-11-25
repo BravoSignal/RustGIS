@@ -5331,6 +5331,9 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
         if let Some(connection) = p.get("connection") {
             q["connection"] = connection.clone();
         }
+        if b(p, "anonymous") == Some(true) {
+            q["anonymous"] = json!(true);
+        }
         return super::tiles::add(s, &q);
     }
     // A dated address (one file per date, `{date:YYYY}`) is read in place, following the time
@@ -5943,16 +5946,17 @@ pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, 
     let (file, mut look) = crate::render::rustgis_tiles::cog::split(url);
     // A key given as `null` (a script's unused one) asks for nothing.
     let given = |k: &str| p.get(k).filter(|v| !v.is_null());
+    let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
     // A data cube's file stays a tile layer, its project opened again too: its address says so.
     look.cube |= b(p, "cube") == Some(true);
     let dated = rustgis_data::time::is_template(file) || ["start", "end", "unit", "interval", "dates"].iter().any(|k| given(k).is_some());
     if !dated && !look.aef && !look.cube {
-        return add_in_place(s, name, file, &look, strict, b(p, "zoom"), probed);
+        return add_in_place(s, name, file, &look, strict, b(p, "zoom"), probed, anonymous);
     }
     let url = crate::render::rustgis_tiles::cog::with_look(url, &look);
     let mut q = json!({"url": url, "kind": "cog", "name": name, "top": true});
     // A dated address's span and steps (see map.addTiles).
-    for k in ["start", "end", "unit", "interval", "dates", "connection"] {
+    for k in ["start", "end", "unit", "interval", "dates", "connection", "anonymous"] {
         if let Some(v) = given(k) {
             q[k] = v.clone();
         }
@@ -5968,18 +5972,29 @@ pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, 
         let dated = s.map().tiles.get(index).ok_or("added GeoTIFF tile is missing")?.url.clone();
         // Its header read now (natively) as an undated address's is before it is added.
         #[cfg(not(target_arch = "wasm32"))]
-        let probe = if s.leave_downloads { Ok(false) } else { crate::render::rustgis_tiles::cog::probe_blocking(&dated) };
+        let probe = if s.leave_downloads {
+            Ok(false)
+        } else {
+            let fetch_dated = crate::service_logins::fetch_url(anonymous, &dated);
+            crate::render::rustgis_tiles::cog::probe_blocking(&fetch_dated)
+        };
         #[cfg(target_arch = "wasm32")]
-        let probe: Result<bool, String> = Ok(false);
+        let probe: Result<bool, String> = {
+            let _ = anonymous;
+            Ok(false)
+        };
         (dated, probe == Ok(true), probe.err())
     } else {
         (url.to_string(), probed, None)
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let info = if probed {
-        crate::render::rustgis_tiles::cog::info_blocking(&url).map(Some)
-    } else {
-        crate::render::rustgis_tiles::cog::info(&url)
+    let info = {
+        let fetch_url = crate::service_logins::fetch_url(anonymous, &url);
+        if probed {
+            crate::render::rustgis_tiles::cog::info_blocking(&fetch_url).map(Some)
+        } else {
+            crate::render::rustgis_tiles::cog::info(&fetch_url)
+        }
     };
     #[cfg(target_arch = "wasm32")]
     let info = crate::render::rustgis_tiles::cog::info(&url);
@@ -6071,6 +6086,7 @@ pub(crate) fn cog_tile_losses(info: &crate::render::rustgis_tiles::cog::Info) ->
 /// `zoom` is the adding command's `"zoom"`:
 /// `Some(true)` frames it, `Some(false)` keeps the view, `None` frames it only as the first content
 /// on an empty map. `probed` is [`add_cog`]'s.
+#[expect(clippy::too_many_arguments, reason = "in-place COG helper mirrors add_cog_with options")]
 fn add_in_place(
     s: &mut Session,
     name: &str,
@@ -6079,6 +6095,7 @@ fn add_in_place(
     strict: bool,
     zoom: Option<bool>,
     probed: bool,
+    anonymous: bool,
 ) -> CmdResult {
     use crate::render::rustgis_tiles::cog;
     // Judged as an address a project keeps is (a host, no spaces, not too long) before it is read.
@@ -6089,8 +6106,10 @@ fn add_in_place(
     // doesn't hold the window. Otherwise read with the other layers added with it (see
     // `project::read_in_place`); in the browser, landing later.
     #[cfg(not(target_arch = "wasm32"))]
+    let fetch_file = crate::service_logins::fetch_url(anonymous, file);
+    #[cfg(not(target_arch = "wasm32"))]
     let layer = if strict && s.in_place_wait {
-        rustgis_map::raster::RasterLayer::in_place(cog::raster::overview_blocking(file)?, file)
+        rustgis_map::raster::RasterLayer::in_place(cog::raster::overview_blocking(&fetch_file)?, file)
     } else if strict {
         rustgis_map::raster::RasterLayer::opening_in_place(file)
     } else {
@@ -6098,7 +6117,7 @@ fn add_in_place(
     };
     #[cfg(target_arch = "wasm32")]
     let layer = {
-        let _ = strict;
+        let _ = (strict, anonymous);
         rustgis_map::raster::RasterLayer::opening_in_place(file)
     };
     let layer = layer.with_look(super::tiles::address_look(look));
@@ -6108,7 +6127,7 @@ fn add_in_place(
     // login ended): the layer would go unframed. A plugin's command in the app doesn't wait (it
     // runs on the frame), as in the browser.
     #[cfg(not(target_arch = "wasm32"))]
-    let info = if probed && !s.leave_downloads { cog::info_blocking(file).map(Some) } else { cog::info(file) };
+    let info = if probed && !s.leave_downloads { cog::info_blocking(&fetch_file).map(Some) } else { cog::info(&fetch_file) };
     #[cfg(target_arch = "wasm32")]
     let info = {
         let _ = probed;

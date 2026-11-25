@@ -27,6 +27,8 @@ pub fn commands() -> Vec<C> {
         C::new("earthdata.status", "Earthdata Login Status", "Home › Add › Web Data › NASA Earthaccess", |s, _p| {
             // Only a native user session may restore from the keychain (when saved secrets are
             // enabled) or mutate process-wide expiry state; other scopes get a read-only status.
+            // Without opt-in, skip expiry cleanup when the token is remembered in the keychain so
+            // an unopted session does not delete a keychain entry.
             if s.policy_user() {
                 if s.saved_secrets_opted_in {
                     earthdata::restore();
@@ -101,7 +103,8 @@ pub fn collections_query(p: &Value) -> Result<String, String> {
 
 fn collections(s: &mut Session, p: &Value) -> CmdResult {
     let url = collections_query(p)?;
-    let bytes = answer_or_fetch(p, &url, s.web_logins.is_anonymous())?;
+    let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
+    let bytes = answer_or_fetch(p, &url, anonymous)?;
     let found = earthdata::parse_collections(&bytes)?;
     Ok(json!({"count": found.len(), "collections": found.iter().map(earthdata::collection_json).collect::<Vec<_>>()}))
 }
@@ -116,9 +119,10 @@ fn resolve(short: &str, anonymous: bool) -> Result<Collection, String> {
 /// The granule search a command names: its address and the collection's concept id.
 pub fn granules_query(s: &Session, p: &Value) -> Result<String, String> {
     let collection = ps(p, "collection").map(str::trim).filter(|c| !c.is_empty());
+    let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
     let collection = match (collection, ps(p, "shortName").map(str::trim).filter(|c| !c.is_empty())) {
         (Some(c), _) => c.to_string(),
-        (None, Some(short)) => resolve(short, s.web_logins.is_anonymous())?.id,
+        (None, Some(short)) => resolve(short, anonymous)?.id,
         (None, None) => return Err("give collection (a concept id earthdata.collections lists) or shortName".into()),
     };
     // Where the map is, unless asked for everywhere.
@@ -129,7 +133,8 @@ pub fn granules_query(s: &Session, p: &Value) -> Result<String, String> {
 
 fn granules(s: &mut Session, p: &Value) -> CmdResult {
     let url = granules_query(s, p)?;
-    let bytes = answer_or_fetch(p, &url, s.web_logins.is_anonymous())?;
+    let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
+    let bytes = answer_or_fetch(p, &url, anonymous)?;
     let found = earthdata::parse_granules(&bytes)?;
     let mut out = json!({"count": found.len(), "granules": found.iter().map(earthdata::granule_json).collect::<Vec<_>>()});
     if b(p, "footprints").unwrap_or(true) {

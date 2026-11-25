@@ -821,18 +821,51 @@ fn anonymous_reads_suppress_implicit_s3_and_sign_in_credentials() {
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let read_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let seen_srv = seen.clone();
+    let errs_srv = read_errors.clone();
     let stop_srv = stop.clone();
     let server = std::thread::spawn(move || {
+        const MAX_HEADER_BYTES: usize = 16 * 1024;
         while let Ok((mut stream, _)) = listener.accept() {
             if stop_srv.load(Ordering::SeqCst) {
                 break;
             }
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let mut complete = false;
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            complete = true;
+                            break;
+                        }
+                        if buf.len() > MAX_HEADER_BYTES {
+                            errs_srv
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(format!("oversized request headers ({} bytes)", buf.len()));
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        errs_srv.lock().unwrap_or_else(|e| e.into_inner()).push(format!("header read failed: {e}"));
+                        break;
+                    }
+                }
+            }
+            if !complete {
+                if !stop_srv.load(Ordering::SeqCst) && errs_srv.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    errs_srv.lock().unwrap_or_else(|e| e.into_inner()).push(format!("incomplete request headers ({} bytes)", buf.len()));
+                }
+                continue;
+            }
+            let req = String::from_utf8_lossy(&buf).into_owned();
             let first = req.lines().next().unwrap_or("");
             if first.contains("/__stop") {
                 let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -890,7 +923,7 @@ fn anonymous_reads_suppress_implicit_s3_and_sign_in_credentials() {
         assert!(!r.contains("AKIA_SYNTH_ANON") && !r.to_ascii_lowercase().contains("authorization:"), "s3.list signed anonymously: {r}");
     }
 
-    // 2. Zarr metadata fetches under anonymous session must not carry S3 signing headers.
+    // 2. Zarr metadata fetches under anonymous session or explicit anonymous param must not sign.
     crate::service_logins::anonymously(&mut s, true, |s| {
         let _ = s.run("raster.zarrInfo", &json!({"url": format!("{base}/priv-bkt-anon/store.zarr")}));
     })
@@ -899,6 +932,43 @@ fn anonymous_reads_suppress_implicit_s3_and_sign_in_credentials() {
     assert!(!zarr_reqs.is_empty());
     for r in &zarr_reqs {
         assert!(!r.contains("AKIA_SYNTH_ANON") && !r.to_ascii_lowercase().contains("authorization:"), "zarr signed anonymously: {r}");
+    }
+    let _ = s.run("raster.zarrInfo", &json!({"url": format!("{base}/priv-bkt-anon/explicit-anon.zarr"), "anonymous": true}));
+    let explicit_zarr_reqs = std::mem::take(&mut *seen.lock().unwrap_or_else(|e| e.into_inner()));
+    assert!(!explicit_zarr_reqs.is_empty());
+    for r in &explicit_zarr_reqs {
+        assert!(
+            !r.contains("AKIA_SYNTH_ANON") && !r.to_ascii_lowercase().contains("authorization:"),
+            "zarr explicit anonymous signed: {r}"
+        );
+    }
+
+    // 2b. Time-following Zarr layers tagged anonymous stay anonymous outside an anonymous scope.
+    {
+        let mut rl = rustgis_map::raster::RasterLayer::unread_in_place(format!("{base}/priv-bkt-anon/follow.zarr"));
+        rl.time_zarr = Some(rustgis_map::raster::ZarrTime {
+            store: format!("{base}/priv-bkt-anon/follow.zarr"),
+            variable: "v".into(),
+            index: vec![],
+            dim: "t".into(),
+            offset: 0,
+            dates: vec![0.0, 86_400_000.0],
+            crs: None,
+            window: None,
+            shown: None,
+            read_generation: rustgis_map::raster::next_read_generation(),
+        });
+        let id = s.map_mut().add_raster("AnonZarr", rl);
+        s.map_mut().layer_mut(id).unwrap().anonymous = true;
+        crate::cmd::zarr::follow_time_now(&mut s);
+        let follow_reqs = std::mem::take(&mut *seen.lock().unwrap_or_else(|e| e.into_inner()));
+        assert!(!follow_reqs.is_empty());
+        for r in &follow_reqs {
+            assert!(
+                !r.contains("AKIA_SYNTH_ANON") && !r.to_ascii_lowercase().contains("authorization:"),
+                "follow_time signed an anonymous Zarr layer: {r}"
+            );
+        }
     }
 
     // 3. layer.addUrl under anonymous session must not carry S3 signing headers.
@@ -925,6 +995,8 @@ fn anonymous_reads_suppress_implicit_s3_and_sign_in_credentials() {
     stop.store(true, Ordering::SeqCst);
     let _ = std::net::TcpStream::connect(addr);
     let _ = server.join();
+    let errs = read_errors.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(errs.is_empty(), "mock HTTP server saw incomplete or failed header reads: {errs:?}");
     let _ = s.run("s3.disconnect", &json!({"name": "priv-anon-test"}));
     let _ = s.run("s3.disconnect", &json!({"name": "pub-anon-test"}));
 }
@@ -946,7 +1018,11 @@ fn map_set_tiles_legend_requires_network_and_preserves_existing_tile_layers() {
         assert!(!effects.contains(Effect::Network), "clearing legend must not require Network: {clearing}");
     }
 
-    s.run("map.addTiles", &json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "name": "Base"})).unwrap();
+    s.run(
+        "map.addTiles",
+        &json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "name": "Base", "legend": "https://tiles.example.org/orig.png"}),
+    )
+    .unwrap();
     isolate_plugins();
     plugin("plug-no-net-legend", &["edit"]);
     let err =
@@ -955,10 +1031,13 @@ fn map_set_tiles_legend_requires_network_and_preserves_existing_tile_layers() {
     assert!(err.contains("network"), "{err}");
     assert_eq!(s.map().tiles.len(), 1, "existing tile layer must be preserved");
     assert_eq!(s.map().tiles[0].name, "Base");
-    assert!(s.map().tiles[0].legends.is_empty());
+    assert_eq!(s.map().tiles[0].legends.len(), 1);
+    assert_eq!(s.map().tiles[0].legends[0].url, "https://tiles.example.org/orig.png");
 
-    // Clearing legends remains allowed for an edit-only plugin.
+    // Clearing an existing legend remains allowed for an edit-only plugin.
     forward(&mut s, "plug-no-net-legend", "map.setTiles", json!({"name": "Base", "legend": null})).unwrap();
+    assert_eq!(s.map().tiles.len(), 1);
+    assert!(s.map().tiles[0].legends.is_empty());
     rustgis_plugins::unload("plug-no-net-legend");
 }
 
@@ -1096,6 +1175,14 @@ fn project_log_scrubs_active_logins_and_s3_wrappers() {
     assert!(!err.contains(&active_secret), "session log error leaked active login: {err}");
     assert!(!err.contains("rustgis-s3:"), "session log error leaked s3 wrapper: {err}");
     assert!(!err.contains(&s3_tok), "session log error leaked wrapped token: {err}");
+
+    // An active login spanning the error clip boundary must be scrubbed before truncation.
+    let pad = "a".repeat(1985);
+    let _ = s.run("layer.rename", &json!({"layer": format!("{pad}{active_secret}tail")}));
+    let entry = s.log.entries().last().unwrap();
+    let clipped_err = entry.error.as_deref().unwrap_or("");
+    assert!(!clipped_err.contains(&active_secret), "clipped error leaked active login: {clipped_err}");
+    assert!(!clipped_err.contains(&active_secret[..8]), "clipped error leaked active login prefix: {clipped_err}");
 }
 
 #[cfg(not(target_arch = "wasm32"))]

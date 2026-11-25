@@ -125,17 +125,14 @@ pub(crate) fn kept_params(params: &Value) -> Value {
     }
 }
 
-/// An error as the log keeps it: clipped to [`LOG_ERROR_CHARS`] before its secrets are taken out,
-/// so a long one costs little (a secret cut short still follows its name).
+/// An error as the log keeps it: active logins and `rustgis-s3:` wrappers are scrubbed before
+/// clipping to [`LOG_ERROR_CHARS`] so a secret spanning the clip boundary cannot leave a prefix
+/// behind, then other secrets are removed.
 fn kept_error(e: &str) -> String {
-    let e = if e.chars().nth(LOG_ERROR_CHARS).is_some() {
-        format!("{}…", e.chars().take(LOG_ERROR_CHARS).collect::<String>())
-    } else {
-        e.to_string()
-    };
-    let e = crate::sources::scrub_s3_wrappers(&e);
-    let e = crate::cmd::history::redacted_text(&sql_secrets_removed(&e));
-    crate::sources::scrub_s3_wrappers(&crate::render::rustgis_tiles::logins::scrub(&e))
+    let e = scrub_log_text(e);
+    let e =
+        if e.chars().nth(LOG_ERROR_CHARS).is_some() { format!("{}…", e.chars().take(LOG_ERROR_CHARS).collect::<String>()) } else { e };
+    crate::cmd::history::redacted_text(&sql_secrets_removed(&e))
 }
 
 /// `v` without secrets: as History's Copy as code takes them out (`history::redacted`), and,
@@ -207,7 +204,7 @@ fn redacted(v: &Value) -> Value {
 /// Removes active login values and runtime capability wrappers from every string and object key
 /// retained in log parameters.
 fn scrub_log_text(t: &str) -> String {
-    crate::sources::scrub_s3_wrappers(&crate::render::rustgis_tiles::logins::scrub(t))
+    crate::render::rustgis_tiles::logins::scrub(&crate::sources::scrub_s3_wrappers(t))
 }
 
 fn scrub_log_value(v: Value, depth: usize) -> Value {

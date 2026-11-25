@@ -852,10 +852,11 @@ fn crosses_origin(from: &str, to: &str) -> bool {
 /// fetched within the reach of the one before it, the service's document first (`public`: it was
 /// read from the internet), as their fetches observed it.
 #[cfg(not(target_arch = "wasm32"))]
-fn advertised_template(source: &str, list: &str, vector: bool, withheld: &mut u32, public: bool) -> AdvertisedTemplate {
+fn advertised_template(source: &str, list: &str, vector: bool, withheld: &mut u32, public: bool, anonymous: bool) -> AdvertisedTemplate {
     let reach = if public { Reach::Public } else { Reach::Local };
     advertised_template_with(source, list, vector, withheld, reach, |doc, reach| {
-        let fetched = cache::download_blocking_with_origin_within(doc, cache::MAX_DOWNLOAD, cache::BLOCKING_TIMEOUT, &[], reach)
+        let fetch_doc = crate::service_logins::fetch_url(anonymous, doc);
+        let fetched = cache::download_blocking_with_origin_within(&fetch_doc, cache::MAX_DOWNLOAD, cache::BLOCKING_TIMEOUT, &[], reach)
             .map_err(cache::large_file_hint)?;
         Ok((fetched.bytes, fetched.origin.reach()))
     })
@@ -1004,7 +1005,7 @@ fn left_template(
 
 /// In the browser nothing waits: the app reads the template itself and passes it as `"tiles"`.
 #[cfg(target_arch = "wasm32")]
-fn advertised_template(source: &str, list: &str, _: bool, _: &mut u32, _: bool) -> AdvertisedTemplate {
+fn advertised_template(source: &str, list: &str, _: bool, _: &mut u32, _: bool, _: bool) -> AdvertisedTemplate {
     AdvertisedTemplate { template: None, crossed_origin: crosses_origin(source, list), fallback: None, public: false }
 }
 
@@ -1441,7 +1442,9 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
             }
         }
         (Some(list), None) => {
-            let advertised = advertised_template(source, list, matches!(layer.offer, Offer::VectorTiles { .. }), withheld, public);
+            let anonymous = s.web_logins.is_anonymous() || super::b(p, "anonymous") == Some(true);
+            let advertised =
+                advertised_template(source, list, matches!(layer.offer, Offer::VectorTiles { .. }), withheld, public, anonymous);
             if let Some(note) = &advertised.fallback {
                 s.notify(note.clone(), false);
             }

@@ -726,16 +726,19 @@ impl Bridge<'_> {
             return Err(format!("{label}: {why}"));
         }
         // Without `network`, no command may bring in a tile address (a map file read from text
-        // carries its tile layers), or change where an existing layer or its legends fetch from:
-        // on violation, each pre-existing map's tiles are restored from its snapshot rather than
-        // dropping modified layers. Where a layer fetches from is decided by its address, kind,
-        // subdomains, row order and legend addresses. Its name, attribution and opacity never
-        // reach a server, and its tile size reaches one only as `{width}`/`{height}` (256 or 512).
-        let fetched = |t: &rustgis_map::TileLayer| {
-            (t.url.clone(), t.kind, t.subdomains.clone(), t.tms, t.legends.iter().map(|l| l.url.clone()).collect::<Vec<_>>())
+        // carries its tile layers), or introduce a new legend address on an existing tile layer
+        // (clearing or removing legends requires no network). On violation, each pre-existing map's
+        // tiles are restored from its snapshot rather than dropping modified layers. Where a layer
+        // fetches from is decided by its address, kind, subdomains, row order and legend addresses.
+        // Its name, attribution and opacity never reach a server, and its tile size reaches one
+        // only as `{width}`/`{height}` (256 or 512).
+        let tile_base = |t: &rustgis_map::TileLayer| (t.url.clone(), t.kind, t.subdomains.clone(), t.tms);
+        let tile_sources = |s: &Session| {
+            let bases: std::collections::HashSet<_> = s.project.maps.iter().flat_map(|m| &m.tiles).map(tile_base).collect();
+            let legends: std::collections::HashSet<String> =
+                s.project.maps.iter().flat_map(|m| &m.tiles).flat_map(|t| t.legends.iter().map(|l| l.url.clone())).collect();
+            (bases, legends)
         };
-        let tile_sources =
-            |s: &Session| -> std::collections::HashSet<_> { s.project.maps.iter().flat_map(|m| &m.tiles).map(fetched).collect() };
         let before = (!self.plugin.manifest.has(Permission::Network)).then(|| {
             let sources = tile_sources(self.s);
             let snapshots: std::collections::HashMap<u64, Vec<rustgis_map::TileLayer>> =
@@ -749,14 +752,15 @@ impl Bridge<'_> {
             super::workflows::steps_of(s, |s| s.invoke(op, crate::policy::Txn::Shared))
         })
         .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
-        if let Some((sources, mut snapshots)) = before {
-            let violated = self.s.project.maps.iter().flat_map(|m| &m.tiles).any(|t| !sources.contains(&fetched(t)));
+        if let Some(((bases, legends), mut snapshots)) = before {
+            let allowed = |t: &rustgis_map::TileLayer| bases.contains(&tile_base(t)) && t.legends.iter().all(|l| legends.contains(&l.url));
+            let violated = self.s.project.maps.iter().flat_map(|m| &m.tiles).any(|t| !allowed(t));
             if violated {
                 for m in &mut self.s.project.maps {
                     if let Some(saved) = snapshots.remove(&m.instance_id()) {
                         m.tiles = saved;
                     } else {
-                        m.tiles.retain(|t| sources.contains(&fetched(t)));
+                        m.tiles.retain(allowed);
                     }
                 }
                 res = Err(format!("{} needs the 'network' permission to add tile layers", self.plugin.manifest.name));

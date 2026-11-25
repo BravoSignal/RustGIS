@@ -321,7 +321,8 @@ fn search_static(s: &mut Session, p: &Value, root: &str) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let walk = stac::catalog::walk_blocking(root, filter, search.limit);
+        let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
+        let walk = stac::catalog::walk_blocking_with(root, filter, search.limit, anonymous);
         let complete = walk.complete();
         let (read, failed) = (walk.reads, walk.failed);
         let (refused, skipped) = (walk.refused(), walk.skipped());
@@ -397,6 +398,9 @@ fn add_asset(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some(connection) = p.get("connection") {
         add["connection"] = connection.clone();
+    }
+    if b(p, "anonymous") == Some(true) {
+        add["anonymous"] = json!(true);
     }
     let added = super::layer::add_url(s, &add)?;
     match codes {
@@ -524,7 +528,8 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
         // A static collection has no search: read by its layout, and no pages follow.
         crate::render::rustgis_tiles::address::check(&api, None)?;
         let filter = stac::catalog::Filter::from_search(&search, None)?;
-        let found = stac::dated::search_blocking(&api, &filter, (&day(start), &day(end)), max_items)?;
+        let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
+        let found = stac::dated::search_blocking_with(&api, &filter, (&day(start), &day(end)), max_items, anonymous)?;
         // Its items say which collection it is; another name given is a mistake.
         if let Some(other) = found.items.iter().map(|i| i.collection.as_str()).find(|c| !c.is_empty() && *c != collection) {
             return Err(format!("{api} holds {other}, not {collection}"));

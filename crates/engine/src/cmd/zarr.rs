@@ -344,7 +344,7 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let anonymous = s.web_logins.is_anonymous();
+        let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
         let (root, store, mut v) = info_of(p, anonymous)?;
         // A bbox: the window of cells it is in a variable's grid, for layer.addZarr's cells.
         if let Some(asked) = asked_window(p)? {
@@ -566,7 +566,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             super::raster::add_raster(s, &name, layer)
         }
         Source::Url(u) => {
-            let anonymous = s.web_logins.is_anonymous();
+            let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
             let store = store_at(&u, &sel.variable, anonymous)?;
             pick_variable(&store, &mut sel)?;
             let cut = place_window(&u, &store, &mut sel, asked, anonymous)?;
@@ -593,7 +593,14 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             // The coordinate system given for a store that doesn't say, kept as a folder's slice
             // keeps it, so a time series read from the layer finds it.
             layer.crs = crs.map(str::to_string);
-            super::raster::add_raster(s, &name, layer)
+            let out = super::raster::add_raster(s, &name, layer)?;
+            if anonymous
+                && let Some(id) = s.active_layer
+                && let Some(l) = s.map_mut().layer_mut(id)
+            {
+                l.anonymous = true;
+            }
+            Ok(out)
         }
     }
 }
@@ -1215,6 +1222,7 @@ fn follow(s: &mut Session, wait: bool) {
             for l in &mut m.layers {
                 let owner = (map, l.instance_id());
                 let name = l.name.clone();
+                let layer_anonymous = anonymous || l.anonymous;
                 let Some(rl) = l.raster.as_mut() else { continue };
                 let Some(zt) = rl.time_zarr.as_mut() else { continue };
                 let want = zt.step_for(window);
@@ -1230,7 +1238,7 @@ fn follow(s: &mut Session, wait: bool) {
                     }
                     // Consume this layer's original completion, including its lifetime at landing.
                     Some(i) if !wait => {
-                        let read = s.zarr_reads.for_layer(owner, zt, i, anonymous);
+                        let read = s.zarr_reads.for_layer(owner, zt, i, layer_anonymous);
                         let result = observed.entry(std::sync::Arc::as_ptr(&read)).or_insert_with(|| read.poll()).clone();
                         // The shared observation does not replace the lifetime check at delivery.
                         let result = result.map(|r| crate::render::rustgis_tiles::cache::check_still(&read.still).and(r));
@@ -1239,7 +1247,7 @@ fn follow(s: &mut Session, wait: bool) {
                                 rl.data = Some(r);
                                 zt.shown = Some(i);
                                 if is_web(&zt.store) {
-                                    ahead.push((zt.clone(), i, read.still.clone()));
+                                    ahead.push((zt.clone(), i, read.still.clone(), layer_anonymous));
                                 }
                             }
                             Some(Err(e)) => {
@@ -1250,17 +1258,17 @@ fn follow(s: &mut Session, wait: bool) {
                             None => {
                                 waiting.insert(owner);
                                 if is_web(&zt.store) {
-                                    ahead.push((zt.clone(), i, read.still.clone()));
+                                    ahead.push((zt.clone(), i, read.still.clone(), layer_anonymous));
                                 }
                             }
                         }
                     }
-                    Some(i) => match read_waiting(zt, i, anonymous) {
+                    Some(i) => match read_waiting(zt, i, layer_anonymous) {
                         Ok(r) => {
                             rl.data = Some(r);
                             zt.shown = Some(i);
                             if is_web(&zt.store) {
-                                ahead.push((zt.clone(), i, crate::render::rustgis_tiles::cache::current_still()));
+                                ahead.push((zt.clone(), i, crate::render::rustgis_tiles::cache::current_still(), layer_anonymous));
                             }
                         }
                         Err(e) => {
@@ -1290,8 +1298,8 @@ fn follow(s: &mut Session, wait: bool) {
             };
             s.notify(text, true);
         }
-        for (zt, i, still) in ahead {
-            crate::render::rustgis_tiles::cache::with_optional_still(still, || read_ahead(zt, i, anonymous));
+        for (zt, i, still, layer_anonymous) in ahead {
+            crate::render::rustgis_tiles::cache::with_optional_still(still, || read_ahead(zt, i, layer_anonymous));
         }
     }
     #[cfg(target_arch = "wasm32")]
@@ -1318,7 +1326,7 @@ fn add_following(s: &mut Session, p: &Value, asked: Option<Asked>) -> CmdResult 
         if let Some(c) = &crs {
             Crs::parse(c)?;
         }
-        let anonymous = s.web_logins.is_anonymous();
+        let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
         let (root, store, chunks) = match src {
             Source::Dir(d) => {
                 let store = zarr::read_metadata(Path::new(&d)).map_err(|e| format!("{d}: {e}"))?;
@@ -1467,6 +1475,12 @@ fn add_following(s: &mut Session, p: &Value, asked: Option<Asked>) -> CmdResult 
         });
         layer.time_zarr = Some(zt);
         let mut out = super::raster::add_raster(s, &name, layer)?;
+        if anonymous
+            && let Some(id) = s.active_layer
+            && let Some(l) = s.map_mut().layer_mut(id)
+        {
+            l.anonymous = true;
+        }
         let said: Vec<String> = window_notes.into_iter().chain(part).collect();
         for w in &said {
             s.warn(w.clone());
@@ -1491,6 +1505,7 @@ struct SeriesSource {
     period: Option<(u64, usize)>,
     crs: Option<String>,
     read_generation: u64,
+    anonymous: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1507,6 +1522,7 @@ fn series_source(s: &Session, p: &Value) -> Result<SeriesSource, String> {
                 period: Some((zt.offset, zt.dates.len())),
                 crs: zt.crs.clone(),
                 read_generation: zt.read_generation,
+                anonymous: l.anonymous,
             });
         }
         // A slice: its store is its folder, or the address it was read from.
@@ -1522,13 +1538,21 @@ fn series_source(s: &Session, p: &Value) -> Result<SeriesSource, String> {
             period: None,
             crs: rl.crs.clone(),
             read_generation: rustgis_map::raster::next_read_generation(),
+            anonymous: l.anonymous,
         });
     }
     let root = match source(p)? {
         Source::Dir(d) | Source::Url(d) => d,
     };
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
-    Ok(SeriesSource { root, sel: selection(p), period: None, crs, read_generation: rustgis_map::raster::next_read_generation() })
+    Ok(SeriesSource {
+        root,
+        sel: selection(p),
+        period: None,
+        crs,
+        read_generation: rustgis_map::raster::next_read_generation(),
+        anonymous: false,
+    })
 }
 
 /// A store's metadata, and its files `keys`: a folder's read (files only, bounded), a web
@@ -1829,7 +1853,8 @@ pub fn series_start(s: &Session, p: &Value) -> Result<SeriesRun, String> {
         }
     };
     let (start, end) = (date("start")?, date("end")?);
-    Ok(SeriesRun { lon, lat, src, start, end, anonymous: s.web_logins.is_anonymous() })
+    let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true) || src.anonymous;
+    Ok(SeriesRun { lon, lat, src, start, end, anonymous })
 }
 
 // --- A summary over time (opengeos/RustGIS#556) ----------------------------------------------------
@@ -1999,8 +2024,8 @@ pub struct ZarrCube {
 /// The cube of a Zarr layer, or of the store and variable the parameters name.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn zarr_cube(s: &Session, p: &Value) -> Result<ZarrCube, String> {
-    let anonymous = s.web_logins.is_anonymous();
     let mut src = series_source(s, p)?;
+    let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true) || src.anonymous;
     // A layer that is a window of its variable: its steps over time would be read whole.
     if src.sel.window.is_some() {
         return Err(format!(
