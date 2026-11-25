@@ -916,10 +916,11 @@ fn kmeans_on(threads: Option<usize>, r: &Raster, bands: &[usize], k: usize, iter
         return Err("too few valid pixels to classify".into());
     }
     let band0 = data.first().copied().unwrap_or(&[]);
+    let norm = |v: f32| if v == 0.0 { 0.0 } else { v };
     let mut sorted = valid.clone();
     sorted.sort_by(|a, b| {
-        let va = band0.get(*a).copied().unwrap_or(0.0);
-        let vb = band0.get(*b).copied().unwrap_or(0.0);
+        let va = norm(band0.get(*a).copied().unwrap_or(0.0));
+        let vb = norm(band0.get(*b).copied().unwrap_or(0.0));
         va.total_cmp(&vb)
     });
     let mut centres: Vec<Vec<f64>> =
@@ -2202,6 +2203,16 @@ mod tests {
         let _installed = crate::control::install(Some(mid.clone()));
         assert_eq!(kmeans_on(Some(1), &r, &[0, 1, 2], 7, 10).unwrap_err(), crate::control::CANCELLED);
         assert_eq!(mid.looked(), 3);
+    }
+
+    #[test]
+    fn kmeans_seed_sort_treats_negative_and_positive_zero_as_equal() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let band0 = vec![0.0, 0.0, 0.0, 0.0, 0.0, -0.0, -0.0, -0.0];
+        let band1 = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let r = Raster::new("zeros", 8, 1, vec![band0, band1], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let classes = kmeans_on(Some(1), &r, &[0, 1], 2, 1).unwrap();
+        assert_eq!(classes, vec![1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
     }
 
     /// Zonal means test only the cells in their zone's window (#1252), and give what testing
