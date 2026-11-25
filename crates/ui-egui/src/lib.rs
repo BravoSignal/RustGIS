@@ -233,6 +233,58 @@ pub const MARKER_FILE_MAX_BYTES: usize = rustgis_engine::map::symbology::MAX_PIC
 /// lists every file).
 pub const MARKER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "svg"];
 
+/// Extensions offered when opening a project, shared between desktop (`ui.open`) and browser
+/// (`purpose == "project"`).
+pub const PROJECT_EXTS: &[&str] = &["rgis", "rgisx", "rgispkg", "rgisfield", "qgs", "qgz", "geolibre", "json"];
+
+/// Extensions offered when opening a project item in the browser (`purpose == "item"`), kept in
+/// sync with [`OPEN_ITEMS`], `ui.reportLayoutFile`, and ModelBuilder's import picker.
+pub const ITEM_EXTS: &[&str] = &[
+    "rgismap",
+    "rgismpk",
+    "rgispkg",
+    "rgislyr",
+    "rgisstyle",
+    "rgisramp",
+    "rgistemplate",
+    "rgistask",
+    "rgisbookmarks",
+    "rgis",
+    "rgisx",
+    "qml",
+    "rgisreport",
+    "rgisrpttemplate",
+    "rgispres",
+    "rgisnb",
+    "ipynb",
+    "rgisdlpk",
+    "rgisfield",
+    "json",
+    "rgistool",
+    "rgislayout",
+];
+
+/// Every `ui.openItem` kind: `(kind, command, desktop extensions, filter label, web picker purpose)`.
+const OPEN_ITEMS: &[(&str, &str, &[&str], &str, &str)] = &[
+    ("map", "map.import", &["rgismap", "rgismpk", "rgis", "rgisx", "rgispkg"], "RustGIS maps and projects", "item"),
+    ("layer", "layer.addLayerFile", &["rgislyr"], "RustGIS layer file", "item"),
+    ("styles", "style.add", &["rgisstyle"], "RustGIS styles", "item"),
+    ("ramps", "ramp.add", &["rgisramp", "xml", "qml", "txt", "clr", "cpt"], "Colour ramps (RustGIS, QGIS, GDAL, GMT)", "ramp"),
+    ("importStyles", "style.import", &["rgislyr", "rgismap", "rgis", "rgisx"], "RustGIS layers, maps and projects", "item"),
+    ("geolibreProject", "project.importGeolibre", &["geolibre", "json"], "GeoLibre project", "project"),
+    ("qgisProject", "project.importQgis", &["qgs", "qgz"], "QGIS project", "qgisProject"),
+    ("qgisStyle", "style.importQgis", &["qml"], "QGIS layer style", "item"),
+    ("template", "project.fromTemplate", &["rgistemplate"], "RustGIS project template", "item"),
+    ("task", "task.import", &["rgistask"], "RustGIS task", "item"),
+    ("bookmarks", "bookmark.import", &["rgisbookmarks"], "RustGIS bookmarks", "item"),
+    ("report", "report.open", &["rgisreport", "rgisrpttemplate"], "RustGIS report or report template", "item"),
+    ("presentation", "presentation.import", &["rgispres"], "RustGIS presentation", "item"),
+    ("notebook", "notebook.open", &["rgisnb", "ipynb"], "RustGIS or Jupyter notebook", "item"),
+    ("dlPackage", "dl.import", &["rgisdlpk"], "RustGIS deep learning package", "item"),
+    // A field package sent back from a phone: its edits, to the area it came from.
+    ("fieldPackage", "offline.bringBack", &["rgisfield"], "RustGIS field package", "item"),
+];
+
 /// The largest script file the Script pane's Load… reads, as the assistant's command file; the
 /// browser's shell refuses a larger one before reading it.
 pub const SCRIPT_FILE_MAX_BYTES: usize = 1024 * 1024;
@@ -3265,7 +3317,16 @@ impl RustGisApp {
     pub fn open_peer_text(&mut self, text: &str) -> Result<(), String> {
         let report = self.session.open_peer_text(rustgis_engine::Peer::Embedder, text)?;
         assistantpane::peer_replaced(self);
+        crate::vertexedit::cancel_stale_drag(self);
+        annotation::sync(self);
+        crate::boxedit::cancel_stale(self);
+        crate::circleedit::cancel_stale(self);
+        if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
+            self.ui.symbology_pending = None;
+        }
         self.reset_after_project_replace();
+        table::prune_views(self);
+        layoutview::follow_project(self);
         for notice in report.notices() {
             self.session.notify(notice, false);
         }
@@ -3277,13 +3338,6 @@ impl RustGisApp {
     fn reset_after_project_replace(&mut self) {
         self.map.cancel_sketch();
         pluginpanel::cancel_pick(self);
-        crate::vertexedit::cancel_stale_drag(self);
-        annotation::sync(self);
-        crate::boxedit::cancel_stale(self);
-        crate::circleedit::cancel_stale(self);
-        if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
-            self.ui.symbology_pending = None;
-        }
         // A project replacing this one hasn't been saved in the browser yet (opening a file
         // names it again).
         self.ui.web_file = None;
@@ -3305,8 +3359,6 @@ impl RustGisApp {
         // command waiting for it went with the old project's waits.
         self.retire_cog_probes();
         self.ws.task_edit = None;
-        table::prune_views(self);
-        layoutview::follow_project(self);
     }
 
     /// Reports pending header reads retired by either ordinary or peer project replacement.
@@ -4905,10 +4957,7 @@ impl RustGisApp {
                     }
                     open("project");
                     self.ui.backstage = false;
-                } else if let Some(path) = dialogs::pick_open(
-                    &["rgis", "rgisx", "rgispkg", "rgisfield", "qgs", "qgz", "geolibre", "json"],
-                    tl!("Projects and JSON data (RustGIS, QGIS, GeoLibre)"),
-                ) {
+                } else if let Some(path) = dialogs::pick_open(PROJECT_EXTS, tl!("Projects and JSON data (RustGIS, QGIS, GeoLibre)")) {
                     // A QGIS project opens as a new map of this one.
                     let lower = path.to_ascii_lowercase();
                     let cmd = if lower.ends_with(".qgs") || lower.ends_with(".qgz") {
@@ -5145,37 +5194,17 @@ impl RustGisApp {
             }
             "ui.openItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
-                let (cmd, exts, label): (&str, &[&str], &str) = match kind {
-                    "map" => ("map.import", &["rgismap", "rgismpk", "rgis", "rgisx", "rgispkg"], "RustGIS maps and projects"),
-                    "layer" => ("layer.addLayerFile", &["rgislyr"], "RustGIS layer file"),
-                    "styles" => ("style.add", &["rgisstyle"], "RustGIS styles"),
-                    "ramps" => ("ramp.add", &["rgisramp", "xml", "qml", "txt", "clr", "cpt"], "Colour ramps (RustGIS, QGIS, GDAL, GMT)"),
-                    "importStyles" => ("style.import", &["rgislyr", "rgismap", "rgis", "rgisx"], "RustGIS layers, maps and projects"),
-                    "geolibreProject" => ("project.importGeolibre", &["geolibre", "json"], "GeoLibre project"),
-                    "qgisProject" => ("project.importQgis", &["qgs", "qgz"], "QGIS project"),
-                    "qgisStyle" => ("style.importQgis", &["qml"], "QGIS layer style"),
-                    "template" => ("project.fromTemplate", &["rgistemplate"], "RustGIS project template"),
-                    "task" => ("task.import", &["rgistask"], "RustGIS task"),
-                    "bookmarks" => ("bookmark.import", &["rgisbookmarks"], "RustGIS bookmarks"),
-                    "report" => ("report.open", &["rgisreport", "rgisrpttemplate"], "RustGIS report or report template"),
-                    "presentation" => ("presentation.import", &["rgispres"], "RustGIS presentation"),
-                    "notebook" => ("notebook.open", &["rgisnb", "ipynb"], "RustGIS or Jupyter notebook"),
-                    "dlPackage" => ("dl.import", &["rgisdlpk"], "RustGIS deep learning package"),
-                    // A field package sent back from a phone: its edits, to the area it came from.
-                    "fieldPackage" => ("offline.bringBack", &["rgisfield"], "RustGIS field package"),
-                    k => return Err(format!("unknown item '{k}'")),
-                };
+                let (cmd, exts, label, purpose) = OPEN_ITEMS
+                    .iter()
+                    .find(|(k, ..)| *k == kind)
+                    .map(|&(_, cmd, exts, label, purpose)| (cmd, exts, label, purpose))
+                    .ok_or_else(|| format!("unknown item '{kind}'"))?;
                 if let Some(open) = &self.services.open_async {
                     self.ui.pending_open = Some(cmd);
                     if let Some(snapshot) = &self.services.open_options {
                         snapshot(&self.ui);
                     }
-                    open(match kind {
-                        "ramps" => "ramp",
-                        "geolibreProject" => "project",
-                        "qgisProject" => "qgisProject",
-                        _ => "item",
-                    });
+                    open(purpose);
                 } else if let Some(path) = dialogs::pick_open(exts, tl!(label)) {
                     let r = self.run_by_user(cmd, json!({"path": path}));
                     self.map.invalidate();
@@ -10164,20 +10193,10 @@ mod peer_output_tests {
             app,
         );
         h.run_steps(3);
-        // Start a real map sketch point and a real box-edit drag.
-        h.state_mut().run("tool.set", json!({"tool": "measure"})).unwrap();
-        h.run_steps(2);
         let view = h.state().map.view_rect.unwrap().0;
         let at = view.center();
-        h.event(egui::Event::PointerMoved(at));
-        for pressed in [true, false] {
-            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
-        }
-        h.run_steps(2);
-        assert_eq!(h.state().map.sketch_len(), 1);
-
+        // Start an active rotated-box drag and a pending plugin pick, then verify peer replacement clears them.
         h.state_mut().run("tool.set", json!({"tool": "rotatedBox"})).unwrap();
-        // Put the sketch point back via measure? Actually test sketch and box separately via open_peer_text.
         assert!(crate::boxedit::drag_start(h.state_mut(), view, at, true));
         crate::boxedit::drag_to(h.state_mut(), view, at + egui::vec2(40.0, 40.0), false);
         assert!(crate::boxedit::drawing(h.state()));
@@ -10203,6 +10222,30 @@ mod peer_output_tests {
         assert_eq!(h.state().map.sketch_len(), 1);
         h.state_mut().open_peer_text(&text).unwrap();
         assert_eq!(h.state().map.sketch_len(), 0, "open_peer_text must cancel active map sketch");
+    }
+
+    /// Every extension handled by `ui.openItem` (plus layout templates and models opened via
+    /// `"item"`) must stay covered by `PROJECT_EXTS` and `ITEM_EXTS`.
+    #[test]
+    fn shared_picker_extension_lists_cover_all_open_item_specs() {
+        for &(kind, _, exts, _, purpose) in OPEN_ITEMS {
+            match purpose {
+                "project" => {
+                    for ext in exts {
+                        assert!(PROJECT_EXTS.contains(ext), "PROJECT_EXTS is missing .{ext} for {kind}");
+                    }
+                }
+                "item" => {
+                    for ext in exts {
+                        assert!(ITEM_EXTS.contains(ext), "ITEM_EXTS is missing .{ext} for {kind}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        for ext in std::iter::once(&"rgislayout").chain(modelbuilder::MODEL_EXTS.iter()) {
+            assert!(ITEM_EXTS.contains(ext), "ITEM_EXTS is missing .{ext}");
+        }
     }
 }
 

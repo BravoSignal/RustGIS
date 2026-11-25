@@ -1,33 +1,7 @@
-//! Browser file-picker extension filters, kept in parity with the extensions `ui-egui` accepts.
+//! Browser file-picker extension filters, shared with `ui-egui` so desktop and browser filters
+//! cannot drift.
 
-/// Extensions offered when opening a project (`purpose == "project"`).
-pub(crate) const PROJECT_EXTS: &[&str] = &["rgis", "rgisx", "rgispkg", "rgisfield", "qgs", "qgz", "geolibre", "json"];
-
-/// Extensions offered when opening a project item (`purpose == "item"`).
-pub(crate) const ITEM_EXTS: &[&str] = &[
-    "rgismap",
-    "rgismpk",
-    "rgispkg",
-    "rgislyr",
-    "rgisstyle",
-    "rgisramp",
-    "rgistemplate",
-    "rgistask",
-    "rgisbookmarks",
-    "rgis",
-    "rgisx",
-    "qml",
-    "rgisreport",
-    "rgisrpttemplate",
-    "rgispres",
-    "rgisnb",
-    "ipynb",
-    "rgisdlpk",
-    "rgisfield",
-    "json",
-    "rgistool",
-    "rgislayout",
-];
+pub(crate) use rustgis_ui_egui::{ITEM_EXTS, PROJECT_EXTS};
 
 /// Returns the static extension filter list for a named picker `purpose`, when it uses one.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -43,41 +17,10 @@ pub(crate) fn filter_extensions(purpose: &str) -> Option<&'static [&'static str]
 mod tests {
     use super::*;
 
-    /// Every project and item extension that `ui-egui` opens via `open_async("project")` or
-    /// `open_async("item")` must be selectable in the browser file picker.
+    /// The browser picker re-exports `ui-egui`'s canonical project and item extension slices.
     #[test]
-    fn browser_picker_extensions_cover_all_project_and_item_formats() {
-        let project = filter_extensions("project").unwrap();
-        for ext in ["rgis", "rgisx", "rgispkg", "rgisfield", "qgs", "qgz", "geolibre", "json"] {
-            assert!(project.contains(&ext), "project picker is missing .{ext}");
-        }
-
-        let item = filter_extensions("item").unwrap();
-        for ext in [
-            "rgismap",
-            "rgismpk",
-            "rgispkg",
-            "rgislyr",
-            "rgisstyle",
-            "rgisramp",
-            "rgistemplate",
-            "rgistask",
-            "rgisbookmarks",
-            "rgis",
-            "rgisx",
-            "qml",
-            "rgisreport",
-            "rgisrpttemplate",
-            "rgispres",
-            "rgisnb",
-            "ipynb",
-            "rgisdlpk",
-            "rgisfield",
-            "json",
-            "rgistool",
-            "rgislayout",
-        ] {
-            assert!(item.contains(&ext), "item picker is missing .{ext}");
-        }
+    fn browser_picker_extensions_match_ui_egui_lists() {
+        assert_eq!(filter_extensions("project"), Some(rustgis_ui_egui::PROJECT_EXTS));
+        assert_eq!(filter_extensions("item"), Some(rustgis_ui_egui::ITEM_EXTS));
     }
 }

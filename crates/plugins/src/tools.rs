@@ -424,12 +424,18 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
         return Ok(ToolResult { losses: Vec::new(), output: Output::Selection { layer, rows }, messages });
     }
     let mut outs = Vec::new();
-    let mut losses = Vec::new();
+    let mut grouped_losses: Vec<(rustgis_data::loss::LossCode, Vec<(String, String)>)> = Vec::new();
     let mut push_report = |name: &str, report: rustgis_data::ReadReport| {
-        for note in report.messages.prefixed(name) {
+        for note in report.messages {
             match note.loss {
-                Some(code) => losses.push(rustgis_data::loss::LossMessage { code, text: note.text }),
-                None => messages.push(note.text),
+                Some(code) => {
+                    if let Some((_, entries)) = grouped_losses.iter_mut().find(|(c, _)| *c == code) {
+                        entries.push((name.to_string(), note.text));
+                    } else {
+                        grouped_losses.push((code, vec![(name.to_string(), note.text)]));
+                    }
+                }
+                None => messages.push(note.prefixed(name).text),
             }
         }
     };
@@ -443,6 +449,34 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
         push_report(&ds.name, report);
         outs.push(OutputLayer::Table(ds));
     }
+    let losses = grouped_losses
+        .into_iter()
+        .map(|(code, entries)| {
+            const SHOWN: usize = 3;
+            let text = if let [(name, detail)] = entries.as_slice() {
+                format!("{name}: {detail}")
+            } else {
+                let mut names: Vec<&str> = Vec::new();
+                for (name, _) in &entries {
+                    if !names.contains(&name.as_str()) {
+                        names.push(name.as_str());
+                    }
+                }
+                let detail = entries.first().map_or("", |(_, d)| d.as_str());
+                if let [only] = names.as_slice() {
+                    format!("{only}: {} notices: {detail}", entries.len())
+                } else {
+                    let listed = if names.len() <= SHOWN {
+                        names.join(", ")
+                    } else {
+                        format!("{}, and {} more", names[..SHOWN].join(", "), names.len() - SHOWN)
+                    };
+                    format!("{tool}: {} outputs ({listed}): {detail}", names.len())
+                }
+            };
+            rustgis_data::loss::LossMessage { code, text }
+        })
+        .collect();
     Ok(ToolResult { losses, output: Output::Layers(outs), messages })
 }
 
@@ -484,7 +518,8 @@ mod tests {
     }
 
     /// GeoJSON loss notices from plugin tool outputs (layers and tables) reach `ToolResult.losses`
-    /// (and unclassified notices reach `ToolResult.messages`), while clean outputs emit none.
+    /// grouped as one notice per `LossCode` across all outputs (with count and layer names), while
+    /// clean outputs emit none.
     #[test]
     fn plugin_tool_output_propagates_geojson_loss_notices_and_stays_clean_when_lossless() {
         let clean = json!({
@@ -507,15 +542,40 @@ mod tests {
         assert!(res.losses.is_empty(), "clean output must have no losses: {:?}", res.losses);
         assert!(res.messages.is_empty(), "clean output must have no messages: {:?}", res.messages);
 
-        let lossy = json!({
+        // Single lossy output keeps its direct layer-prefixed message.
+        let single = json!({
             "layers": [{
-                "name": "Peaks",
+                "name": "Solo",
                 "geojson": {
                     "type": "FeatureCollection",
-                    "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:CUSTOM::999"}},
-                    "features": [{"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [10.0, 50.0, 1200.0]}}]
+                    "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [10.0, 50.0, 100.0]}}]
                 }
-            }],
+            }]
+        });
+        let res = output(&single, "demo").unwrap();
+        assert_eq!(res.losses.len(), 1, "{:?}", res.losses);
+        assert_eq!(res.losses[0].code, rustgis_data::loss::LossCode::DroppedZm);
+        assert!(res.losses[0].text.starts_with("Solo: "), "{:?}", res.losses[0].text);
+        assert!(res.messages.is_empty(), "classified losses belong in losses only: {:?}", res.messages);
+
+        // Multiple outputs sharing a loss kind emit one grouped notice per LossCode with count and names.
+        let point_3d = |name: &str, crs: Option<&str>| {
+            let mut fc = json!({
+                "type": "FeatureCollection",
+                "features": [{"type": "Feature", "properties": {"name": name}, "geometry": {"type": "Point", "coordinates": [10.0, 50.0, 1200.0]}}]
+            });
+            if let Some(crs) = crs {
+                fc["crs"] = json!({"type": "name", "properties": {"name": crs}});
+            }
+            json!({"name": name, "geojson": fc})
+        };
+        let lossy = json!({
+            "layers": [
+                point_3d("Peaks", Some("urn:ogc:def:crs:CUSTOM::999")),
+                point_3d("Ridges", None),
+                point_3d("Valleys", None),
+                point_3d("Passes", None),
+            ],
             "tables": [{
                 "name": "Summary",
                 "geojson": {
@@ -526,20 +586,18 @@ mod tests {
             }]
         });
         let res = output(&lossy, "demo").unwrap();
+        assert_eq!(res.losses.len(), 2, "must emit exactly one LossMessage per LossCode: {:?}", res.losses);
+        let zm = res.losses.iter().find(|l| l.code == rustgis_data::loss::LossCode::DroppedZm).expect("DroppedZm loss");
         assert!(
-            res.losses.iter().any(|l| l.code == rustgis_data::loss::LossCode::DroppedZm && l.text.starts_with("Peaks: ")),
-            "expected DroppedZm loss for Peaks: {:?}",
-            res.losses
+            zm.text.contains("4 outputs (Peaks, Ridges, Valleys, and 1 more)"),
+            "expected grouped count and layer names for DroppedZm, got: {}",
+            zm.text
         );
+        let crs = res.losses.iter().find(|l| l.code == rustgis_data::loss::LossCode::AssumedCrs).expect("AssumedCrs loss");
         assert!(
-            res.losses.iter().any(|l| l.code == rustgis_data::loss::LossCode::AssumedCrs && l.text.starts_with("Peaks: ")),
-            "expected AssumedCrs loss for Peaks: {:?}",
-            res.losses
-        );
-        assert!(
-            res.losses.iter().any(|l| l.code == rustgis_data::loss::LossCode::AssumedCrs && l.text.starts_with("Summary: ")),
-            "expected AssumedCrs loss for Summary: {:?}",
-            res.losses
+            crs.text.contains("2 outputs (Peaks, Summary)"),
+            "expected grouped count and output names for AssumedCrs, got: {}",
+            crs.text
         );
         assert!(res.messages.is_empty(), "classified losses belong in losses only: {:?}", res.messages);
     }
