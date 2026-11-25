@@ -230,7 +230,7 @@ fn import_project(s: &mut Session, p: &Value) -> CmdResult {
         // The tiles a web tile layer landed on the map as, when it is one.
         let mut landed_on = None;
         let result = if layer.kind == "annotation" {
-            add_annotations(s, layer, crs, canvas.as_ref(), dir.is_some(), &mut pictures, &mut report)
+            add_annotations(s, layer, crs, canvas.as_ref(), dir.as_deref(), &mut pictures, &mut report)
                 .map(|(name, d)| Some((name, Some(d))))
         } else {
             add_layer(s, layer, dir.is_some(), view, &mut landed_on, &mut connections, &mut report)
@@ -922,12 +922,30 @@ fn saved_database_connection(s: &mut Session, what: &str, connection: &str, made
 /// `graphics::picture` reads), each read once, and at most [`qgis::MAX_ANNOTATIONS`] items a layer
 /// placed. Running the whole import off the window, with Cancel and progress, is for the import
 /// as a whole, not this layer kind.
+/// Defensively validates a picture annotation path before filesystem access, returning the
+/// resolved source to read. A path already resolved under the user-opened project folder `dir`
+/// (including when `dir` itself is a network share) is checked on its relative remainder so
+/// projects opened from a UNC folder keep loading relative pictures while other shares and unsafe
+/// paths stay refused.
+fn checked_annotation_picture(picture: &str, dir: Option<&str>) -> Result<qgis::ImageSource, &'static str> {
+    let base = dir.map(|d| d.trim_end_matches(['/', '\\'])).filter(|d| !d.is_empty());
+    if let Some(base) = base
+        && let Some(rest) = picture.strip_prefix(base).and_then(|r| r.strip_prefix('/'))
+        && !rest.is_empty()
+        && !rest.starts_with(['/', '\\'])
+    {
+        qgis::local_image_source(rest, base)
+    } else {
+        qgis::local_image_source(picture, dir.unwrap_or(""))
+    }
+}
+
 fn add_annotations(
     s: &mut Session,
     layer: &qgis::ProjectLayer,
     project_crs: Option<&str>,
     canvas: Option<&rustgis_data::raster::crs::Transformer>,
-    has_dir: bool,
+    dir: Option<&str>,
     pictures: &mut Pictures,
     report: &mut Report,
 ) -> Result<(String, Drawn), String> {
@@ -993,14 +1011,14 @@ fn add_annotations(
                 Some(Ok(b64)) if b64.len() > left => None,
                 Some(read) => Some(read.clone()),
                 None => {
-                    let read = match qgis::local_image_source(picture, if has_dir { "/" } else { "" }) {
+                    let read = match checked_annotation_picture(picture, dir) {
                         Err(why) => Err(format!("{picture}: {why}")),
                         Ok(source) => {
                             // Its size first, from its text or its file's length (base64 is 4 bytes for 3):
                             // one that can't fit isn't read.
                             let size = match &source {
                                 qgis::ImageSource::Base64 => Some(picture.strip_prefix("base64:").unwrap_or_default().trim().len()),
-                                qgis::ImageSource::File(_) => std::fs::metadata(picture)
+                                qgis::ImageSource::File(path) => std::fs::metadata(path)
                                     .ok()
                                     .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX).div_ceil(3).saturating_mul(4)),
                             };
@@ -1013,7 +1031,7 @@ fn add_annotations(
                                 qgis::ImageSource::Base64 => {
                                     super::graphics::picture(&json!({"image": picture.strip_prefix("base64:").unwrap_or_default()}))
                                 }
-                                qgis::ImageSource::File(_) => super::graphics::picture(&json!({"path": picture})),
+                                qgis::ImageSource::File(path) => super::graphics::picture(&json!({"path": path})),
                             }
                         }
                     };
@@ -2153,9 +2171,72 @@ mod tests {
         };
         let mut pictures = Pictures::default();
         let mut report = Report::default();
-        add_annotations(&mut s, &layer, Some("EPSG:4326"), None, true, &mut pictures, &mut report).unwrap();
+        add_annotations(&mut s, &layer, Some("EPSG:4326"), None, Some("/tmp"), &mut pictures, &mut report).unwrap();
         let added = s.map().layer_by_name("Direct").unwrap();
         assert!(added.dataset.features.is_empty());
         assert!(report.notes.iter().any(|n| n.text.contains("network share")), "{:?}", report.notes);
+    }
+
+    #[test]
+    fn add_annotations_keeps_relative_pictures_under_unc_project_folder_and_uses_resolved_path() {
+        let unc_dir = r"\\server\share\proj";
+        let qgs = r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></projectCrs><projectlayers>
+          <maplayer type="annotation"><id>a</id><layername>UncPics</layername><items>
+            <item type="picture" path="pic.png" xMin="0" yMin="0" xMax="1" yMax="1"/>
+          </items></maplayer></projectlayers></qgis>"#;
+        let mut report = Report::default();
+        let project = qgis::read_project(qgs, unc_dir, &mut |_| Err("unused"), &mut report).unwrap();
+        assert_eq!(project.layers[0].annotations.len(), 1);
+        let resolved = project.layers[0].annotations[0].picture.as_deref().unwrap();
+        assert_eq!(resolved, r"\\server\share\proj/pic.png");
+        assert_eq!(checked_annotation_picture(resolved, Some(unc_dir)), Ok(qgis::ImageSource::File(r"\\server\share\proj/pic.png".into())));
+        // A different network share is still refused even when the project itself lives on a UNC folder.
+        assert!(checked_annotation_picture(r"\\other\share\pic.png", Some(unc_dir)).is_err());
+        assert!(checked_annotation_picture(r"\\server\share\proj//other/pic.png", Some(unc_dir)).is_err());
+
+        // Round-trip through add_annotations: not rejected as a network share.
+        let mut s = Session::new(crate::Project::default());
+        let mut pictures = Pictures::default();
+        add_annotations(&mut s, &project.layers[0], Some("EPSG:4326"), None, Some(unc_dir), &mut pictures, &mut report).unwrap();
+        assert!(!report.notes.iter().any(|n| n.text.contains("network share")), "{:?}", report.notes);
+
+        // Unresolved relative picture uses the real project folder and reads the validated path.
+        let dir = std::env::temp_dir().join(format!("rustgis-qgis-ann-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = tiny_skia::Pixmap::new(2, 2).unwrap().encode_png().unwrap();
+        std::fs::write(dir.join("pic.png"), &png).unwrap();
+        let rect = rustgis_data::Geometry::Polygon(vec![vec![vec![
+            rustgis_geom::Coord::new(0.0, 0.0),
+            rustgis_geom::Coord::new(1.0, 0.0),
+            rustgis_geom::Coord::new(1.0, 1.0),
+            rustgis_geom::Coord::new(0.0, 1.0),
+            rustgis_geom::Coord::new(0.0, 0.0),
+        ]]]);
+        let rel_layer = qgis::ProjectLayer {
+            id: "r".into(),
+            name: "RelPic".into(),
+            provider: String::new(),
+            kind: "annotation".into(),
+            vector: false,
+            visible: true,
+            checked: true,
+            group: None,
+            definition_query: None,
+            crs: Some("EPSG:4326".into()),
+            source: qgis::Source::Other { provider: String::new() },
+            style: qgis::Style::default(),
+            annotations: vec![qgis::Annotation {
+                graphic: rustgis_map::graphics::Graphic::new("picture", rect),
+                picture: Some("pic.png".into()),
+                keep_aspect: false,
+            }],
+        };
+        let mut rel_report = Report::default();
+        let mut rel_pics = Pictures::default();
+        add_annotations(&mut s, &rel_layer, Some("EPSG:4326"), None, Some(&dir.to_string_lossy()), &mut rel_pics, &mut rel_report).unwrap();
+        let added = s.map().layer_by_name("RelPic").unwrap();
+        assert_eq!(added.dataset.features.len(), 1, "{:?}", rel_report.notes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
