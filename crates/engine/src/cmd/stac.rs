@@ -129,7 +129,8 @@ pub(super) fn collections(s: &mut Session, p: &Value) -> CmdResult {
         } else {
             stac::collections_url(&api)
         };
-        let fetched = crate::render::rustgis_tiles::cache::download_blocking_with_origin(&url)?;
+        let fetch_url = crate::service_logins::fetch_url(s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true), &url);
+        let fetched = crate::render::rustgis_tiles::cache::download_blocking_with_origin(&fetch_url)?;
         collections_json_from_origin(s, &api, &fetched.bytes, &fetched.origin)
     }
 }
@@ -209,20 +210,21 @@ fn search(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
         // A shape goes in the body of a POST, which has no limit that matters; a server that
         // refuses it is asked again in the query, when the shape is short enough for one.
         let (fetched, posted) = if search.intersects.is_some() {
-            let post = stac::search_post_url(&api);
+            let post = crate::service_logins::fetch_url(anonymous, &stac::search_post_url(&api));
             let body = stac::search_body(&search)?.to_string();
             match crate::render::rustgis_tiles::cache::post_json_named_blocking_with_origin(&post, &body) {
                 Ok(fetched) => (fetched, true),
                 Err(e) => {
-                    let url = stac::search_url(&api, &search).map_err(|_| e.clone())?;
+                    let url = crate::service_logins::fetch_url(anonymous, &stac::search_url(&api, &search).map_err(|_| e.clone())?);
                     (crate::render::rustgis_tiles::cache::download_blocking_with_origin(&url).map_err(|_| e)?, false)
                 }
             }
         } else {
-            let url = stac::search_url(&api, &search)?;
+            let url = crate::service_logins::fetch_url(anonymous, &stac::search_url(&api, &search)?);
             (crate::render::rustgis_tiles::cache::download_blocking_with_origin(&url)?, false)
         };
         let bytes = fetched.bytes;
@@ -349,7 +351,7 @@ fn search_static(s: &mut Session, p: &Value, root: &str) -> CmdResult {
 }
 
 /// The item a command names: given whole, or by its address.
-fn item(p: &Value) -> Result<Item, String> {
+fn item(p: &Value, anonymous: bool) -> Result<Item, String> {
     if let Some(v) = p.get("item").filter(|v| v.is_object()) {
         // Given whole (by the assistant or a plugin, maybe from another answer): it came from no
         // address, so its assets may only be public web addresses.
@@ -358,12 +360,13 @@ fn item(p: &Value) -> Result<Item, String> {
     let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("give item (a STAC item) or url (an item's address)")?;
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = url;
+        let _ = (url, anonymous);
         Err("in the web app, add STAC assets with Home › Add › Web Data › STAC Search".into())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        item_downloaded(crate::render::rustgis_tiles::cache::download_blocking_fetched(url)?, url)
+        let fetch_url = crate::service_logins::fetch_url(anonymous, url);
+        item_downloaded(crate::render::rustgis_tiles::cache::download_blocking_fetched(&fetch_url)?, url)
     }
 }
 
@@ -378,7 +381,7 @@ fn item_downloaded(fetched: crate::render::rustgis_tiles::cache::Fetched, reques
 fn add_asset(s: &mut Session, p: &Value) -> CmdResult {
     let bound = crate::service_logins::request_params(s, p)?;
     let p = bound.as_ref();
-    let i = item(p)?;
+    let i = item(p, s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true))?;
     let (key, href) = i.asset_href(ps(p, "asset"))?;
     // Codes for a failed retrieval (JAXA Earth's `dn.error`), which a data cube skips but a
     // single file draws as values: of the asset `asset_href` picked, by the same selector.
@@ -560,7 +563,8 @@ pub fn cube_files(s: &mut Session, p: &Value, max_items: usize, mask: Option<&st
         if read.len() >= MAX_CUBE_PAGES {
             return Err(format!("more than {MAX_CUBE_PAGES} pages of results: take a shorter period or a smaller area"));
         }
-        let bytes = crate::render::rustgis_tiles::cache::download_blocking(&url)?;
+        let fetch_url = crate::service_logins::fetch_url(s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true), &url);
+        let bytes = crate::render::rustgis_tiles::cache::download_blocking(&fetch_url)?;
         let (page, more) = stac::parse_items(&bytes, &url)?;
         read.push(url);
         if page.is_empty() {

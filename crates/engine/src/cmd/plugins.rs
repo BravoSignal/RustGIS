@@ -726,14 +726,22 @@ impl Bridge<'_> {
             return Err(format!("{label}: {why}"));
         }
         // Without `network`, no command may bring in a tile address (a map file read from text
-        // carries its tile layers), or change where an existing layer fetches from: any such
-        // layer is taken out again. Where a layer fetches from is decided by its address, kind,
-        // subdomains and row order. Its name, attribution and opacity never reach a server, and
-        // its tile size reaches one only as `{width}`/`{height}` (256 or 512).
-        let fetched = |t: &rustgis_map::TileLayer| (t.url.clone(), t.kind, t.subdomains.clone(), t.tms);
+        // carries its tile layers), or change where an existing layer or its legends fetch from:
+        // on violation, each pre-existing map's tiles are restored from its snapshot rather than
+        // dropping modified layers. Where a layer fetches from is decided by its address, kind,
+        // subdomains, row order and legend addresses. Its name, attribution and opacity never
+        // reach a server, and its tile size reaches one only as `{width}`/`{height}` (256 or 512).
+        let fetched = |t: &rustgis_map::TileLayer| {
+            (t.url.clone(), t.kind, t.subdomains.clone(), t.tms, t.legends.iter().map(|l| l.url.clone()).collect::<Vec<_>>())
+        };
         let tile_sources =
             |s: &Session| -> std::collections::HashSet<_> { s.project.maps.iter().flat_map(|m| &m.tiles).map(fetched).collect() };
-        let before = (!self.plugin.manifest.has(Permission::Network)).then(|| tile_sources(self.s));
+        let before = (!self.plugin.manifest.has(Permission::Network)).then(|| {
+            let sources = tile_sources(self.s);
+            let snapshots: std::collections::HashMap<u64, Vec<rustgis_map::TileLayer>> =
+                self.s.project.maps.iter().map(|m| (m.instance_id(), m.tiles.clone())).collect();
+            (sources, snapshots)
+        });
         // The plugin command took the undo snapshot: the commands it runs are part of it, and say
         // what they did in its account ([`Session::shared_step`]).
         let mut res = crate::service_logins::anonymously(self.s, true, |s| {
@@ -741,14 +749,16 @@ impl Bridge<'_> {
             super::workflows::steps_of(s, |s| s.invoke(op, crate::policy::Txn::Shared))
         })
         .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
-        if let Some(before) = before {
-            let mut dropped = false;
-            for m in &mut self.s.project.maps {
-                let n = m.tiles.len();
-                m.tiles.retain(|t| before.contains(&fetched(t)));
-                dropped |= m.tiles.len() != n;
-            }
-            if dropped {
+        if let Some((sources, mut snapshots)) = before {
+            let violated = self.s.project.maps.iter().flat_map(|m| &m.tiles).any(|t| !sources.contains(&fetched(t)));
+            if violated {
+                for m in &mut self.s.project.maps {
+                    if let Some(saved) = snapshots.remove(&m.instance_id()) {
+                        m.tiles = saved;
+                    } else {
+                        m.tiles.retain(|t| sources.contains(&fetched(t)));
+                    }
+                }
                 res = Err(format!("{} needs the 'network' permission to add tile layers", self.plugin.manifest.name));
             }
         }

@@ -246,7 +246,14 @@ type FetchDocument<'a> = &'a mut dyn FnMut(&str, Reach) -> Result<cache::Fetched
 /// Cancel is checked between documents; parsing a single bounded JSON document cannot stop
 /// partway through serde's read.
 fn read_documents(s: &mut Session, p: &Value, left: bool, explicit_map: Option<(&str, Option<&str>)>) -> Result<Discovery, String> {
-    read_documents_with(s, p, left, explicit_map, &mut fetch_document)
+    #[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "blocking fetches are desktop only"))]
+    let anonymous = s.web_logins.is_anonymous() || super::b(p, "anonymous") == Some(true);
+    let mut fetch = |url: &str, ceiling: Reach| {
+        #[cfg(not(target_arch = "wasm32"))]
+        let url = crate::service_logins::fetch_url(anonymous, url);
+        fetch_document(&url, ceiling)
+    };
+    read_documents_with(s, p, left, explicit_map, &mut fetch)
 }
 
 /// [`read_documents`] with its fetch given, so the reach each document is fetched within can be
@@ -637,10 +644,12 @@ pub(crate) fn add_service_layer(
     zoom: Option<bool>,
     file: impl FnOnce(&[u8]) -> Result<String, String>,
 ) -> CmdResult {
+    let anonymous = s.web_logins.is_anonymous() || super::b(p, "anonymous") == Some(true);
     let fetch = |s: &mut Session, url: &str| {
         download_layer_with(s, name, url, cache::MAX_DOWNLOAD, true, |url, max, timeout, ceiling| {
             let ceiling = if public { ceiling.min(Reach::Public) } else { ceiling };
-            cache::download_blocking_with_origin_within(url, max, timeout, &[], ceiling)
+            let fetch_url = crate::service_logins::fetch_url(anonymous, url);
+            cache::download_blocking_with_origin_within(&fetch_url, max, timeout, &[], ceiling)
         })
     };
     let first = fetch(s, url);
@@ -1609,7 +1618,8 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
                         }
                         return super::layer::add_url(s, &q);
                     }
-                    let bytes = crate::render::rustgis_tiles::cache::download_blocking(&get).map_err(|e| format!("{name}: {e}"))?;
+                    let fetch_get = crate::service_logins::fetch_url(anonymous, &get);
+                    let bytes = crate::render::rustgis_tiles::cache::download_blocking(&fetch_get).map_err(|e| format!("{name}: {e}"))?;
                     coverage_check(&name, &bytes)?;
                     let r = super::raster::add_coverage_bytes(s, &json!({"name": name}), format!("{name}.tif"), bytes, asked)?;
                     mark_service_source(s, &r, &get);
@@ -1750,7 +1760,7 @@ fn coverage_request(
     }
     let info = match ps(p, "describe") {
         Some(text) => rustgis_data::ogc::parse_describe(c, text.as_bytes())?,
-        None => fetch_describe(c, &describe)?,
+        None => fetch_describe(c, &describe, anonymous)?,
     };
     // A description read from the internet (here, or by the app, which records it) holds the
     // GetCoverage request built from it there too, however the endpoint's name resolves then.
@@ -1796,9 +1806,10 @@ fn coverage_request_from(
 /// Reads a coverage's description, recording one that came from the internet
 /// ([`cache::restrict_to_public`]) so the GetCoverage request built from it goes only there.
 #[cfg(not(target_arch = "wasm32"))]
-fn fetch_describe(c: &Coverage, describe: &str) -> Result<rustgis_data::ogc::CoverageInfo, String> {
+fn fetch_describe(c: &Coverage, describe: &str, anonymous: bool) -> Result<rustgis_data::ogc::CoverageInfo, String> {
+    let fetch_url = crate::service_logins::fetch_url(anonymous, describe);
     let fetched = cache::download_blocking_with_origin_within(
-        describe,
+        &fetch_url,
         cache::MAX_DOWNLOAD,
         cache::BLOCKING_TIMEOUT,
         &[],
@@ -1813,7 +1824,7 @@ fn fetch_describe(c: &Coverage, describe: &str) -> Result<rustgis_data::ogc::Cov
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fetch_describe(c: &Coverage, _: &str) -> Result<rustgis_data::ogc::CoverageInfo, String> {
+fn fetch_describe(c: &Coverage, _: &str, _: bool) -> Result<rustgis_data::ogc::CoverageInfo, String> {
     Err(format!("{}: in the web app, the description is read first (give it as \"describe\")", c.id))
 }
 
@@ -1905,12 +1916,13 @@ pub(super) fn catalog_search_read(s: &mut Session, p: &Value, read: Option<Reach
         None if ps(p, "text").is_some() && !s.policy_user() => within.min(Reach::Public),
         None => within,
     };
+    let anonymous = s.web_logins.is_anonymous() || super::b(p, "anonymous") == Some(true);
     let (page, reach) = match ps(p, "text") {
         Some(text) => (
             rustgis_data::ogc::parse_records(&request, text.as_bytes()).map_err(|e| crate::sources::message_with_address(url, &e))?,
             within,
         ),
-        None => fetch_records(url, &request, within)?,
+        None => fetch_records(url, &request, within, anonymous)?,
     };
     let mut dropped = 0usize;
     let records: Vec<Value> = page
@@ -1952,8 +1964,9 @@ pub(super) fn catalog_search_read(s: &mut Session, p: &Value, read: Option<Reach
 
 /// Reads a page of records within `ceiling`, with the reach the fetch connected at.
 #[cfg(not(target_arch = "wasm32"))]
-fn fetch_records(url: &str, request: &str, ceiling: Reach) -> Result<(rustgis_data::ogc::RecordPage, Reach), String> {
-    let fetched = cache::download_blocking_with_origin_within(request, cache::MAX_DOWNLOAD, cache::BLOCKING_TIMEOUT, &[], ceiling)
+fn fetch_records(url: &str, request: &str, ceiling: Reach, anonymous: bool) -> Result<(rustgis_data::ogc::RecordPage, Reach), String> {
+    let fetch_url = crate::service_logins::fetch_url(anonymous, request);
+    let fetched = cache::download_blocking_with_origin_within(&fetch_url, cache::MAX_DOWNLOAD, cache::BLOCKING_TIMEOUT, &[], ceiling)
         .map_err(cache::large_file_hint)
         .map_err(|e| crate::sources::message_with_address(url, &e))?;
     let page = rustgis_data::ogc::parse_records(request, &fetched.bytes).map_err(|e| crate::sources::message_with_address(url, &e))?;
@@ -1961,7 +1974,7 @@ fn fetch_records(url: &str, request: &str, ceiling: Reach) -> Result<(rustgis_da
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fetch_records(url: &str, _: &str, _: Reach) -> Result<(rustgis_data::ogc::RecordPage, Reach), String> {
+fn fetch_records(url: &str, _: &str, _: Reach, _: bool) -> Result<(rustgis_data::ogc::RecordPage, Reach), String> {
     Err(crate::sources::message_with_address(url, "in the web app, use Home › Add › Add Data › From Service › Search Catalogue"))
 }
 

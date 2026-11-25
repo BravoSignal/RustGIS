@@ -133,7 +133,9 @@ fn kept_error(e: &str) -> String {
     } else {
         e.to_string()
     };
-    crate::cmd::history::redacted_text(&sql_secrets_removed(&e))
+    let e = crate::sources::scrub_s3_wrappers(&e);
+    let e = crate::cmd::history::redacted_text(&sql_secrets_removed(&e));
+    crate::sources::scrub_s3_wrappers(&crate::render::rustgis_tiles::logins::scrub(&e))
 }
 
 /// `v` without secrets: as History's Copy as code takes them out (`history::redacted`), and,
@@ -199,7 +201,24 @@ fn review_value(v: &Value, depth: usize) -> Result<Value, String> {
 }
 
 fn redacted(v: &Value) -> Value {
-    crate::cmd::history::redacted(&embedded_redacted(v, 0))
+    scrub_log_value(crate::cmd::history::redacted(&embedded_redacted(v, 0)), 0)
+}
+
+/// Removes active login values and runtime capability wrappers from every string and object key
+/// retained in log parameters.
+fn scrub_log_text(t: &str) -> String {
+    crate::sources::scrub_s3_wrappers(&crate::render::rustgis_tiles::logins::scrub(t))
+}
+
+fn scrub_log_value(v: Value, depth: usize) -> Value {
+    match v {
+        Value::String(t) => Value::String(scrub_log_text(&t)),
+        Value::Array(a) if depth < 8 => Value::Array(a.into_iter().map(|x| scrub_log_value(x, depth + 1)).collect()),
+        Value::Object(o) if depth < 8 => {
+            Value::Object(o.into_iter().map(|(k, x)| (scrub_log_text(&k), scrub_log_value(x, depth + 1))).collect())
+        }
+        other => other,
+    }
 }
 
 /// A bounded log-only context check for a short key beside nested connection settings.
@@ -241,7 +260,7 @@ fn embedded_redacted(v: &Value, depth: usize) -> Value {
     match v {
         Value::String(t) => {
             let t = if t.contains('{') { json_in_text_redacted(t) } else { t.clone() };
-            Value::String(sql_secrets_removed(&t))
+            Value::String(crate::sources::scrub_s3_wrappers(&sql_secrets_removed(&t)))
         }
         Value::Array(a) if depth < 8 => Value::Array(a.iter().map(|x| embedded_redacted(x, depth + 1)).collect()),
         Value::Object(o) if depth < 8 => {

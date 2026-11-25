@@ -5288,8 +5288,10 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     // A byte range of a GRIB file (`"bytes"`, #2428): only that range is downloaded, and read as
     // the file. The browser refuses it ([`byte_range`]).
     #[cfg(not(target_arch = "wasm32"))]
+    let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(range) = byte_range(p, url)? {
-        return add_url_range(s, p, url, range, public);
+        return add_url_range(s, p, url, range, public, anonymous);
     }
     #[cfg(target_arch = "wasm32")]
     byte_range(p, url)?;
@@ -5376,7 +5378,7 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
         #[cfg(target_arch = "wasm32")]
         let opened = rustgis_data::source::open_url_now(url);
         #[cfg(not(target_arch = "wasm32"))]
-        let opened = rustgis_data::source::open_url_blocking(url);
+        let opened = rustgis_data::source::open_url_blocking(&crate::service_logins::fetch_url(anonymous, url));
         match opened {
             Ok(src) => return add_remote(s, p, url, src),
             Err(e) if e.to_string().contains(rustgis_data::source::remote::READ_WHOLE) => {}
@@ -5425,11 +5427,12 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
             }
             return Ok(r);
         }
+        let fetch_url = crate::service_logins::fetch_url(anonymous, url);
         // An address without a file name may be a GeoTIFF too: its first bytes are read to see,
         // and anything that doesn't answer as one is downloaded whole, as before.
         let unnamed = !tiff && is_unnamed_url(url);
         if (tiff || unnamed) && !scan && !super::b(p, "whole").unwrap_or(false) {
-            let cog = match crate::render::rustgis_tiles::cog::probe_blocking(url) {
+            let cog = match crate::render::rustgis_tiles::cog::probe_blocking(&fetch_url) {
                 Ok(cog) => cog,
                 Err(_) if unnamed => false,
                 Err(e) => return Err(named(e)),
@@ -5439,17 +5442,17 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
         let bytes = if rustgis_data::io::shapefile_part_urls(url).is_some() {
-            download_shapefile_blocking_with(url, public)?
+            download_shapefile_blocking_with(url, public, anonymous)?
         } else if public {
             crate::render::rustgis_tiles::cache::download_public_within(
-                url,
+                &fetch_url,
                 crate::render::rustgis_tiles::cache::MAX_DOWNLOAD,
                 crate::render::rustgis_tiles::cache::BLOCKING_TIMEOUT,
             )
             .map_err(crate::render::rustgis_tiles::cache::large_file_hint)
             .map_err(named)?
         } else {
-            crate::render::rustgis_tiles::cache::download_blocking(url).map_err(named)?
+            crate::render::rustgis_tiles::cache::download_blocking(&fetch_url).map_err(named)?
         };
         let name = url_file_name(url, &bytes).map_err(named)?;
         let left_out = parts_left_out(url, &bytes, p);
@@ -5567,7 +5570,7 @@ pub fn range_failed(url: &str, e: String) -> String {
 ///
 /// [`cache::NO_RANGES`]: crate::render::rustgis_tiles::cache::NO_RANGES
 #[cfg(not(target_arch = "wasm32"))]
-fn add_url_range(s: &mut Session, p: &Value, url: &str, range: (u64, u64), public: bool) -> CmdResult {
+fn add_url_range(s: &mut Session, p: &Value, url: &str, range: (u64, u64), public: bool, anonymous: bool) -> CmdResult {
     use crate::render::rustgis_tiles::cache;
     if s.leave_downloads {
         let mut asked = p.clone();
@@ -5576,12 +5579,13 @@ fn add_url_range(s: &mut Session, p: &Value, url: &str, range: (u64, u64), publi
     }
     let named = |e: String| crate::sources::message_with_address(url, &e);
     let ranged = ranged_address(url, range);
+    let fetch_ranged = crate::service_logins::fetch_url(anonymous, &ranged);
     let len = usize::try_from(range.1 - range.0 + 1).unwrap_or(usize::MAX);
     let public = public || cache::ceiling_for(url) == crate::render::rustgis_tiles::address::Reach::Public;
     let bytes = if public {
-        cache::download_public_within(&ranged, len, cache::BLOCKING_TIMEOUT)
+        cache::download_public_within(&fetch_ranged, len, cache::BLOCKING_TIMEOUT)
     } else {
-        cache::download_blocking_within(&ranged, len, cache::BLOCKING_TIMEOUT)
+        cache::download_blocking_within(&fetch_ranged, len, cache::BLOCKING_TIMEOUT)
     };
     // Without `large_file_hint`: a range timing out isn't helped by downloading the whole file.
     let bytes = bytes.map_err(|e| range_failed(&ranged, e)).map_err(named)?;
@@ -5716,7 +5720,7 @@ fn parts_left_out(url: &str, bytes: &[u8], p: &Value) -> Option<String> {
 /// `.prj` and `.cpg` beside it (each but the `.dbf` only when it is there), zipped, within one
 /// download's budget together.
 #[cfg(not(target_arch = "wasm32"))]
-fn download_shapefile_blocking_with(url: &str, public: bool) -> Result<Vec<u8>, String> {
+fn download_shapefile_blocking_with(url: &str, public: bool, anonymous: bool) -> Result<Vec<u8>, String> {
     use crate::render::rustgis_tiles::cache;
     let parts = rustgis_data::io::shapefile_part_urls(url).unwrap_or_default();
     if public {
@@ -5728,10 +5732,13 @@ fn download_shapefile_blocking_with(url: &str, public: bool) -> Result<Vec<u8>, 
     let until = std::time::Instant::now() + cache::BLOCKING_TIMEOUT;
     // Past it, a part isn't asked for at all (a zero timeout may mean none), and a timeout says
     // where a large file goes instead.
-    let within = |u: &str, max: usize, omit: &'static [u16]| match until.saturating_duration_since(std::time::Instant::now()) {
-        w if w.is_zero() => Err(cache::large_file_hint("timed out".into())),
-        w if public => cache::download_public_omitting_within(u, max, w, omit).map_err(cache::large_file_hint),
-        w => cache::download_blocking_omitting_within(u, max, w, omit).map_err(cache::large_file_hint),
+    let within = |u: &str, max: usize, omit: &'static [u16]| {
+        let fetch_u = crate::service_logins::fetch_url(anonymous, u);
+        match until.saturating_duration_since(std::time::Instant::now()) {
+            w if w.is_zero() => Err(cache::large_file_hint("timed out".into())),
+            w if public => cache::download_public_omitting_within(&fetch_u, max, w, omit).map_err(cache::large_file_hint),
+            w => cache::download_blocking_omitting_within(&fetch_u, max, w, omit).map_err(cache::large_file_hint),
+        }
     };
     let shp = within(url, cache::MAX_DOWNLOAD, &[]).map_err(|e| part_failed(url, e))?;
     // Already zipped (a server answering the address with its parts): read as it is.
@@ -6348,7 +6355,11 @@ pub fn window_asked_in(s: &Session, p: &Value, seen: Option<[f64; 4]>) -> Result
 /// `layer.addUrl` with `"bbox"`, for those that wait: read here and added.
 #[cfg(not(target_arch = "wasm32"))]
 fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
-    let read = read_cog_window(&window_settled(s, p, url, None)?)?;
+    let mut asked = window_settled(s, p, url, None)?;
+    if s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true) {
+        asked.url = crate::service_logins::fetch_url(true, &asked.url);
+    }
+    let read = read_cog_window(&asked)?;
     add_window(s, p, read)
 }
 

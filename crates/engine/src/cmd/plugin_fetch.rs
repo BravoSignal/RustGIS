@@ -219,7 +219,7 @@ impl Session {
         if !self.plugin_held() {
             return Ok(());
         }
-        let named = web_addresses(params);
+        let named = web_addresses(params)?;
         for url in &named {
             // An address wrong some other way (spaces in it) is the command's to judge; it is
             // held to the internet below all the same.
@@ -236,15 +236,35 @@ impl Session {
     }
 }
 
+/// The most JSON nodes inspected when scanning a plugin command's parameters for web addresses.
+const MAX_ADDRESS_SCAN_NODES: usize = 4096;
+
 /// The web addresses among a command's own parameters, not inside the contents of a file it
-/// gives (`data`, `text`).
-fn web_addresses(params: &Value) -> Vec<&str> {
-    let Some(o) = params.as_object() else { return Vec::new() };
-    o.iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "data" | "text"))
-        .filter_map(|(_, v)| v.as_str().map(str::trim))
-        .filter(|v| is_web_address(v))
-        .collect()
+/// gives (`data`, `text`). Walks nested arrays and objects iteratively up to
+/// [`MAX_ADDRESS_SCAN_NODES`] nodes; overly complex parameters are refused rather than skipped.
+fn web_addresses(params: &Value) -> Result<Vec<&str>, String> {
+    let Some(o) = params.as_object() else { return Ok(Vec::new()) };
+    let mut stack: Vec<&Value> = o.iter().filter(|(key, _)| !matches!(key.as_str(), "data" | "text")).map(|(_, v)| v).collect();
+    let mut out = Vec::new();
+    let mut visited = 0usize;
+    while let Some(v) = stack.pop() {
+        visited += 1;
+        if visited > MAX_ADDRESS_SCAN_NODES {
+            return Err("command parameters are too complex for a plugin network check".into());
+        }
+        match v {
+            Value::String(s) => {
+                let s = s.trim();
+                if is_web_address(s) {
+                    out.push(s);
+                }
+            }
+            Value::Array(a) => stack.extend(a.iter()),
+            Value::Object(m) => stack.extend(m.values()),
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Whether `v` is a web address the app fetches (`http://`, `https://` or `s3://`), as given or

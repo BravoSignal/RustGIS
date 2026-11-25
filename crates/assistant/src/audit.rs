@@ -164,8 +164,15 @@ fn normalized_args(tool: &str, arguments: &Value) -> Value {
 
 /// A string argument without its secrets: an address (one word with a scheme, or a database
 /// connection string) loses its password, keys and tokens; `password=…` in a keyword connection
-/// string is withheld. Other text is kept as it is, not cut at a `?` or `#`.
+/// string is withheld; active web logins and `rustgis-s3:` capability wrappers are scrubbed. Other
+/// text is kept as it is, not cut at a `?` or `#`.
 fn redact_string(s: &str) -> String {
+    let s = rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub(s));
+    let out = redact_string_inner(&s);
+    rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub(&out))
+}
+
+fn redact_string_inner(s: &str) -> String {
     let t = s.trim();
     let lower = t.to_ascii_lowercase();
     // A password given as `password=…` or `password: …` (a keyword connection string, quoted or
@@ -507,5 +514,42 @@ mod tests {
         let output = redact_script(&(clean + "layer.rename {\"layer\":\"RGSYNTH_omitted_line\"}"));
         assert!(output.starts_with("# [1 further script line(s) not recorded]\n"));
         assert!(!output.contains("RGSYNTH_omitted_line"));
+    }
+
+    /// Active web-service logins and `rustgis-s3:` capability wrappers are scrubbed from both
+    /// string arguments and tool error replies in the MCP audit log.
+    #[test]
+    fn audit_scrubs_active_logins_and_s3_wrappers() {
+        let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        s.database_logins.set_store(None);
+        let conn = s
+            .run(
+                "connection.new",
+                &json!({"kind": "wms", "address": "https://audit-active.example.org/wms", "auth": "header", "keyName": "X-Key"}),
+            )
+            .unwrap();
+        let active_secret = "RGSYNTH_active_audit_login_9921";
+        s.run("connection.login", &json!({"id": conn["id"], "apiKey": active_secret})).unwrap();
+
+        let wrapped = "rustgis-s3:0123456789abcdef:22:https://s3.example.org:https://s3.example.org/b/k?token=RGSYNTH_s3_tok_9921";
+        let scrubbed_login = redact_string(&format!("upstream rejected {active_secret}"));
+        assert!(!scrubbed_login.contains(active_secret), "{scrubbed_login}");
+        let scrubbed_s3 = redact_string(&format!("could not read {wrapped}"));
+        assert!(!scrubbed_s3.contains("rustgis-s3:") && !scrubbed_s3.contains("RGSYNTH_s3_tok_9921"), "{scrubbed_s3}");
+
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_layers", "arguments": {}}});
+        let err = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "isError": true,
+                "content": [{"type": "text", "text": format!("failed on {wrapped} with {active_secret}")}]
+            }
+        });
+        let lines = entries("mcp", &call.to_string(), Some(&err.to_string()), Duration::ZERO, 0);
+        let error_text = lines[0]["error"].as_str().unwrap_or("");
+        assert!(!error_text.contains(active_secret), "{error_text}");
+        assert!(!error_text.contains("rustgis-s3:"), "{error_text}");
+        assert!(!error_text.contains("RGSYNTH_s3_tok_9921"), "{error_text}");
     }
 }
