@@ -911,17 +911,6 @@ fn saved_database_connection(s: &mut Session, what: &str, connection: &str, made
     }
 }
 
-/// Adds a QGIS annotation layer as a graphics layer: its annotations taken from its coordinate
-/// system (else the project's, `project_crs`) to longitude/latitude, its pictures read from their
-/// files (a relative one only with the project's folder, `has_dir`), its opacity, blending and
-/// scale range from its style. What can't be placed or read is noted.
-///
-/// On the thread that runs the import, as the import's other layers are: like opening a project,
-/// it adds layers to the session as it goes, and no part of it runs on its own yet. Its work is
-/// bounded: at most [`MAX_PICTURE_BYTES`] of pictures an import (each file at most what
-/// `graphics::picture` reads), each read once, and at most [`qgis::MAX_ANNOTATIONS`] items a layer
-/// placed. Running the whole import off the window, with Cancel and progress, is for the import
-/// as a whole, not this layer kind.
 /// Defensively validates a picture annotation path before filesystem access, returning the
 /// resolved source to read. A path already resolved under the user-opened project folder `dir`
 /// (including when `dir` itself is a network share) is checked on its relative remainder so
@@ -940,6 +929,17 @@ fn checked_annotation_picture(picture: &str, dir: Option<&str>) -> Result<qgis::
     }
 }
 
+/// Adds a QGIS annotation layer as a graphics layer: its annotations taken from its coordinate
+/// system (else the project's, `project_crs`) to longitude/latitude, its pictures read from their
+/// files (a relative one only with the project's folder, `dir`), its opacity, blending and
+/// scale range from its style. What can't be placed or read is noted.
+///
+/// On the thread that runs the import, as the import's other layers are: like opening a project,
+/// it adds layers to the session as it goes, and no part of it runs on its own yet. Its work is
+/// bounded: at most [`MAX_PICTURE_BYTES`] of pictures an import (each file at most what
+/// `graphics::picture` reads), each read once, and at most [`qgis::MAX_ANNOTATIONS`] items a layer
+/// placed. Running the whole import off the window, with Cancel and progress, is for the import
+/// as a whole, not this layer kind.
 fn add_annotations(
     s: &mut Session,
     layer: &qgis::ProjectLayer,
