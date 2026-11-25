@@ -16,11 +16,12 @@ on:
 
 permissions: {}
 
-# Serialize `automerge` label/unlabel events in one group so adding and quickly removing the label
-# cannot race; keep `synchronize` and unrelated labels in separate groups so they cannot replace a
-# pending revoke run.
+# Serialize `automerge` label/unlabel events in one FIFO queue so adding, removing, and re-adding
+# the label cannot race or replace a pending revoke run; keep `synchronize` and unrelated labels in
+# separate groups.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.action == 'synchronize' && 'synchronize' || (github.event.label.name == 'automerge' && 'label' || 'other') }}
+  queue: max
 
 jobs:
   enable:

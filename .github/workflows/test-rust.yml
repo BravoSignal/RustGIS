@@ -160,7 +160,8 @@ jobs:
       # xtask/memory-limits.txt (xtask/src/memory.rs). On Linux (GNU time), when the tests cover
       # rustgis-cli (as they do whenever a package it uses changes) or xtask itself (such as
       # changes to memory-limits.txt or memory.rs). Reuses the rustgis-cli binary nextest built
-      # when present, building it only when xtask ran without rustgis-cli.
+      # when the tests cover it. Otherwise (such as an xtask-only run) it builds rustgis-cli again,
+      # since a cached binary may be stale.
       - name: Peak memory
         if: matrix.os == 'ubuntu-latest' && (inputs.packages == '--workspace' || contains(format('{0} ', inputs.packages), '-p rustgis-cli ') || contains(format('{0} ', inputs.packages), '-p xtask '))
         shell: bash
