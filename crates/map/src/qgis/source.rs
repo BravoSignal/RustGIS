@@ -1028,6 +1028,11 @@ pub enum ImageSource {
     File(String),
 }
 
+/// Whether `path` starts with two path separators (`\\`, `//`, `/\`, `\/`), i.e. a UNC/network share.
+fn is_unc_path(path: &str) -> bool {
+    path.len() > 1 && path.chars().take(2).all(|c| c == '\\' || c == '/')
+}
+
 /// Strips the user-opened project folder `dir` and its following separator from `file`, returning
 /// the remainder. For UNC project folders, `/` and `\` are treated as equivalent in the prefix so
 /// Qt's forward-slash UNC spelling matches a Windows backslash folder.
@@ -1039,7 +1044,7 @@ fn strip_project_dir<'a>(file: &'a str, dir: &str) -> Option<&'a str> {
     if let Some(rest) = file.strip_prefix(base).and_then(|r| r.strip_prefix(['/', '\\'])) {
         return Some(rest);
     }
-    if base.len() > 1 && base.chars().take(2).all(|c| c == '\\' || c == '/') {
+    if is_unc_path(base) {
         let mut f = file.char_indices();
         for bc in base.chars() {
             let (_, fc) = f.next()?;
@@ -1093,7 +1098,7 @@ fn check_image_source(file: &str, dir: &str, resolve: bool) -> Result<ImageSourc
         Err("whose image is at a web address, which RustGIS doesn't fetch")
     } else if !is_relative(file) && is_under_project_dir(file, dir) {
         Ok(ImageSource::File(file.to_string()))
-    } else if file.len() > 1 && file.chars().take(2).all(|c| c == '\\' || c == '/') {
+    } else if is_unc_path(file) {
         // Looking a share up can sign in to the host the file names, which a style or
         // project chose (as an archive on one isn't opened either).
         Err("whose image is on a network share, which RustGIS doesn't open")
@@ -1102,7 +1107,12 @@ fn check_image_source(file: &str, dir: &str, resolve: bool) -> Result<ImageSourc
     } else if is_relative(file) && dir.is_empty() {
         Err("whose image file is relative to a folder the import wasn't given")
     } else if resolve {
-        Ok(ImageSource::File(absolute(file, dir)))
+        let resolved = absolute(file, dir);
+        if is_unc_path(&resolved) && !is_under_project_dir(&resolved, dir) {
+            Err("whose image is on a network share, which RustGIS doesn't open")
+        } else {
+            Ok(ImageSource::File(resolved))
+        }
     } else {
         Ok(ImageSource::File(file.to_string()))
     }

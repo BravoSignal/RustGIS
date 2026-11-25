@@ -3442,4 +3442,16 @@ fn picture_annotations_reject_unsafe_paths() {
     // still resolved relative to `dir` rather than treated as already resolved.
     assert_eq!(local_image_source("maps/logo.png", "maps"), Ok(ImageSource::File("maps/maps/logo.png".into())));
     assert_eq!(check_resolved_image_source("data/../pic.png", "data"), Ok(ImageSource::File("data/../pic.png".into())));
+
+    // A relative picture path inside a UNC project folder stays allowed when it remains under
+    // `dir`, but is refused when `..` climbs outside the opened share folder.
+    assert_eq!(local_image_source("sub/../pic.png", unc_dir), Ok(ImageSource::File(format!("{unc_dir}/sub/../pic.png"))));
+    for escaping in ["../other/pic.png", "sub/../../other/pic.png", "../../../other/share/pic.png"] {
+        assert!(
+            local_image_source(escaping, unc_dir).is_err_and(|e| e.contains("network share")),
+            "{escaping} under {unc_dir} should be refused"
+        );
+    }
+    // Local sibling assets remain allowed when the project folder is local.
+    assert_eq!(local_image_source("../other/pic.png", "/d/proj"), Ok(ImageSource::File("/d/proj/../other/pic.png".into())));
 }
