@@ -438,7 +438,16 @@ impl Session {
     /// authority. Reset advances generation, clears item trust, history, pending work and active
     /// connections; old approvals and continuations must bind to that generation.
     pub fn open_peer_text(&mut self, peer: Peer, text: &str) -> Result<Report, String> {
-        self.with_scope(crate::policy::Scope::peer(), |s| s.open_peer_text_scoped(peer, text))?
+        let mut report = self.with_scope(crate::policy::Scope::peer(), |s| s.open_peer_text_scoped(peer, text))??;
+        crate::cmd::connections::resolve_project(self);
+        crate::cmd::connections::note_waiting(self);
+        self.revision = self.revision.wrapping_add(1);
+        if peer == Peer::Bridge {
+            let (exchange, omitted) = Exchange::record(&self.project, self.opened);
+            self.exchange = Some(exchange);
+            report.not_retained = omitted;
+        }
+        Ok(report)
     }
     /// The existing raw census/reset path runs synchronously under peer provenance.
     fn open_peer_text_scoped(&mut self, peer: Peer, text: &str) -> Result<Report, String> {
@@ -489,14 +498,6 @@ impl Session {
         report.executable_changes = durable::changed_executables(&mut self.project, &mut p)?;
         crate::cmd::project::reset_to(self, p);
         self.path = None;
-        crate::cmd::connections::resolve_project(self);
-        crate::cmd::connections::note_waiting(self);
-        self.revision = self.revision.wrapping_add(1);
-        if peer == Peer::Bridge {
-            let (exchange, omitted) = Exchange::record(&self.project, self.opened);
-            self.exchange = Some(exchange);
-            report.not_retained = omitted;
-        }
         Ok(report)
     }
 }

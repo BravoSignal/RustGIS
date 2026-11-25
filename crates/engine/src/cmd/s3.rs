@@ -267,7 +267,9 @@ pub(super) fn list(s: &mut Session, p: &Value) -> CmdResult {
                 None => s3::grant(&c.name, &bucket),
             }
         }
-        let conn = named.or_else(|| s3::for_bucket(&bucket).filter(|c| !s.web_logins.is_anonymous() || c.credentials.is_none()));
+        let conn = named.or_else(|| {
+            s3::for_bucket(&bucket).filter(|c| (!s.web_logins.is_anonymous() && s.policy_allows_reserved()) || c.credentials.is_none())
+        });
         let (mut prefixes, mut objects, mut token, mut pages) = (Vec::new(), Vec::new(), None::<String>, 0);
         loop {
             let url = s3::list_url(&bucket, &prefix, token.as_deref(), conn.as_ref());
