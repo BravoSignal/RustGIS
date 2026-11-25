@@ -3863,7 +3863,7 @@ fn split_page(bytes: &[u8]) -> Result<Option<(serde_json::Value, Vec<Box<RawValu
 /// Most linked pages (`Phase::Linked`) followed in one read, even if each page returns few items.
 const MAX_LINKED_PAGES: usize = 10_000;
 /// Most consecutive empty linked pages followed before stopping an endless chain of empty `next` links.
-const MAX_EMPTY_LINKED_PAGES: usize = 10;
+const MAX_EMPTY_LINKED_PAGES: usize = 50;
 
 /// Most arrays and objects a page may nest, as reading it into values allows (serde_json's limit).
 const MAX_DEPTH: usize = 127;
@@ -9369,10 +9369,10 @@ mod tests {
         let mut calls = 0usize;
         let (_joined, note) = join_pages(url, empty(1), 100, |_u| {
             calls += 1;
-            assert!(calls <= 100, "linked paging did not stop on endless empty next links");
+            assert!(calls <= MAX_EMPTY_LINKED_PAGES * 2, "linked paging did not stop on endless empty next links");
             Ok(empty(calls + 1))
         });
-        assert!(calls <= 10, "expected cutoff after consecutive empty pages, got {calls} fetches");
+        assert!(calls <= MAX_EMPTY_LINKED_PAGES, "expected cutoff after consecutive empty pages, got {calls} fetches");
         assert!(note.is_some_and(|n| n.contains("empty pages")), "missing empty-page stop notice");
     }
 }

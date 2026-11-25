@@ -1583,8 +1583,14 @@ fn complex_packing_zero_width_and_length_bits_and_cancellation() {
         fn begin(&self, _: u64) {}
         fn advance(&self, _: u64) {}
     }
-    let msg = Cx::new(&[(7, 3, &[5]), (300, 0, &[0; 5]), (2, 9, &[0, 511, 100])]).message();
+    let first = Cx::new(&[(7, 3, &[5]), (300, 0, &[0; 5]), (2, 9, &[0, 511, 100])]).message();
+    // Append a second valid field inside the same GRIB2 message so we also prove decoding stops
+    // immediately after cancellation instead of continuing to later fields.
+    let mut two_fields = first[16 + 21..first.len() - 4].to_vec();
+    two_fields.extend(F2::new(2, 1, vec![1, 2]).sections());
+    let msg = message_of(&two_fields);
     let _guard = crate::progress::install(Some(std::sync::Arc::new(AlwaysCancelled)));
     let decoded = grib2(&msg, usize::MAX, None, Uncounted::default());
-    assert!(decoded.first().is_some_and(std::result::Result::is_err), "expected cancellation error");
+    assert_eq!(decoded.len(), 1, "expected decoding to stop after cancellation");
+    assert!(matches!(decoded.first(), Some(Err(Skip::Cancelled))), "expected Skip::Cancelled");
 }

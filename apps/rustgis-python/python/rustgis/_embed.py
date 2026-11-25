@@ -295,7 +295,7 @@ def _app_src(url: Optional[str], lang: Optional[str]) -> str:
     """
     base = url or os.environ.get("RUSTGIS_WEB_URL") or DEFAULT_URL
     parts = urlsplit(base)
-    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc or not parts.hostname:
         raise ValueError(f"web app url must be an http:// or https:// address with a host, got {base!r}")
     extra = "embed" + (f"&lang={quote(lang)}" if lang else "")
     query = f"{parts.query}&{extra}" if parts.query else extra
