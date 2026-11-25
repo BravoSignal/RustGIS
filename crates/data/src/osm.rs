@@ -25,8 +25,14 @@ const MAX_WAYS: usize = MAX_NODES / 4;
 const MAX_REFS: usize = MAX_NODES * 2;
 const MAX_RELATIONS: usize = MAX_NODES / 40;
 /// The most decoded tag and role text bytes kept across an OSM PBF file: a small compressed block
-/// can repeat one string-table entry across thousands of entities.
+/// can repeat one string-table entry across thousands of entities. Split across nodes, ways and
+/// relations so heavy tags on one kind cannot starve the others.
 const MAX_TEXT_BYTES: usize = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 256 << 20 };
+/// Per-tag overhead (one `(String, String)` entry) charged beside key/value text bytes so
+/// zero-length `("", "")` tag pairs from string-table index 0 cannot allocate unbounded entries.
+const TAG_OVERHEAD: usize = 48;
+/// Per-member role overhead (one `String`) charged beside role text bytes.
+const ROLE_OVERHEAD: usize = 24;
 
 /// Keys with a field of their own (as GDAL's OSM driver gives them).
 const KEYS: &[&str] = &[
@@ -259,7 +265,8 @@ fn ignored(key: &str) -> bool {
         || key.starts_with("openGeoDB:")
 }
 
-/// Whether `keys`/`vals` hold any non-ignored tags and their combined UTF-8 byte length.
+/// Whether `keys`/`vals` hold any non-ignored tags and their combined retained byte cost
+/// (UTF-8 key/value lengths plus [`TAG_OVERHEAD`] per entry).
 fn tags_info(strings: &[String], keys: &[u64], vals: &[u64]) -> (bool, usize) {
     let mut any = false;
     let mut bytes = 0usize;
@@ -273,7 +280,7 @@ fn tags_info(strings: &[String], keys: &[u64], vals: &[u64]) -> (bool, usize) {
             continue;
         }
         any = true;
-        bytes = bytes.saturating_add(k.len()).saturating_add(v.len());
+        bytes = bytes.saturating_add(TAG_OVERHEAD).saturating_add(k.len()).saturating_add(v.len());
     }
     (any, bytes)
 }
@@ -302,10 +309,16 @@ struct Osm {
     capped: bool,
     /// Members omitted at the per-relation limit; wide enough for all bounded relations.
     omitted_members: u64,
-    /// Cumulative bytes of decoded tag and role strings retained across the file.
-    text_bytes: usize,
+    /// Cumulative retained tag/role bytes (including per-entry overhead), tracked separately per
+    /// entity kind so heavy node tags early in a file cannot starve ways or relations.
+    node_text_bytes: usize,
+    way_text_bytes: usize,
+    relation_text_bytes: usize,
+    node_text_limit: usize,
+    way_text_limit: usize,
+    relation_text_limit: usize,
     text_limit: usize,
-    /// Entities and decoded tag/role text bytes omitted after reaching `text_limit`.
+    /// Entities and decoded tag/role text bytes omitted after reaching a text budget.
     text_capped_nodes: u64,
     text_capped_ways: u64,
     text_capped_relations: u64,
@@ -314,6 +327,7 @@ struct Osm {
 
 impl Osm {
     fn with_text_limit(text_limit: usize) -> Self {
+        let share = text_limit / 3;
         Osm {
             nodes: Vec::new(),
             points: Vec::new(),
@@ -322,7 +336,12 @@ impl Osm {
             relations: Vec::new(),
             capped: false,
             omitted_members: 0,
-            text_bytes: 0,
+            node_text_bytes: 0,
+            way_text_bytes: 0,
+            relation_text_bytes: 0,
+            node_text_limit: share,
+            way_text_limit: share,
+            relation_text_limit: text_limit.saturating_sub(share.saturating_mul(2)),
             text_limit,
             text_capped_nodes: 0,
             text_capped_ways: 0,
@@ -331,14 +350,25 @@ impl Osm {
         }
     }
 
-    /// Reserves `bytes` from the retained tag/role text budget.
-    fn try_charge_text(&mut self, bytes: usize) -> bool {
-        let next = self.text_bytes.saturating_add(bytes);
-        if next > self.text_limit {
+    fn try_charge(used: &mut usize, limit: usize, bytes: usize) -> bool {
+        let next = used.saturating_add(bytes);
+        if next > limit {
             return false;
         }
-        self.text_bytes = next;
+        *used = next;
         true
+    }
+
+    fn try_charge_node_text(&mut self, bytes: usize) -> bool {
+        Self::try_charge(&mut self.node_text_bytes, self.node_text_limit, bytes)
+    }
+
+    fn try_charge_way_text(&mut self, bytes: usize) -> bool {
+        Self::try_charge(&mut self.way_text_bytes, self.way_text_limit, bytes)
+    }
+
+    fn try_charge_relation_text(&mut self, bytes: usize) -> bool {
+        Self::try_charge(&mut self.relation_text_bytes, self.relation_text_limit, bytes)
     }
 }
 
@@ -411,7 +441,7 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                     } else if osm.points.len() >= MAX_NODES {
                         osm.capped = true;
                         Vec::new()
-                    } else if !osm.try_charge_text(cost) {
+                    } else if !osm.try_charge_node_text(cost) {
                         osm.text_capped_nodes = osm.text_capped_nodes.saturating_add(1);
                         osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                         Vec::new()
@@ -451,7 +481,7 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                                 && !ignored(k)
                             {
                                 has_tags = true;
-                                cost = cost.saturating_add(k.len()).saturating_add(v.len());
+                                cost = cost.saturating_add(TAG_OVERHEAD).saturating_add(k.len()).saturating_add(v.len());
                             }
                         }
                         let t = if !has_tags {
@@ -459,7 +489,7 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                         } else if osm.points.len() >= MAX_NODES {
                             osm.capped = true;
                             Vec::new()
-                        } else if !osm.try_charge_text(cost) {
+                        } else if !osm.try_charge_node_text(cost) {
                             osm.text_capped_nodes = osm.text_capped_nodes.saturating_add(1);
                             osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                             Vec::new()
@@ -507,7 +537,7 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                         continue;
                     }
                     let (has_tags, cost) = tags_info(&strings, &k, &vv);
-                    if has_tags && !osm.try_charge_text(cost) {
+                    if has_tags && !osm.try_charge_way_text(cost) {
                         osm.text_capped_ways = osm.text_capped_ways.saturating_add(1);
                         osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                         continue;
@@ -573,10 +603,13 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                         let role_bytes = roles
                             .iter()
                             .take(MAX_MEMBERS)
-                            .map(|r| usize::try_from(*r).ok().and_then(|i| strings.get(i)).map_or(0, String::len))
+                            .map(|r| {
+                                let len = usize::try_from(*r).ok().and_then(|i| strings.get(i)).map_or(0, String::len);
+                                ROLE_OVERHEAD.saturating_add(len)
+                            })
                             .fold(0usize, usize::saturating_add);
                         let cost = tag_bytes.saturating_add(role_bytes);
-                        if !osm.try_charge_text(cost) {
+                        if !osm.try_charge_relation_text(cost) {
                             osm.text_capped_relations = osm.text_capped_relations.saturating_add(1);
                             osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                             continue;
@@ -1687,13 +1720,16 @@ pub(crate) mod tests {
         field_bytes(2, &pg, &mut prim);
         blob("OSMData", &prim, true, &mut out);
 
-        // Under a 1024-byte budget: node 1 (516 bytes) fits, nodes 2..=10 (9 * 516 = 4644 bytes),
-        // the tagged way (527 bytes), and the drawn relation (16 + 5120 = 5136 bytes) are left out
-        // and reported with exact counts and byte total.
-        let layers = read_with_text_limit("cap.osm.pbf", &out, 1024).unwrap();
+        // Under a 1800-byte total budget (600 bytes per entity kind):
+        // - node 1 (48 + 516 = 564 bytes) fits; nodes 2..=10 (9 * 564 = 5076 bytes) exceed the
+        //   node share;
+        // - the tagged way (2 * 48 + 527 = 623 bytes) exceeds the 600-byte way share;
+        // - the drawn relation (48 + 16 + 10 * (24 + 512) = 5424 bytes) exceeds the 600-byte
+        //   relation share.
+        let layers = read_with_text_limit("cap.osm.pbf", &out, 1800).unwrap();
         assert_eq!(layers.len(), 1, "only points remain after way and relation are omitted");
         assert_eq!(layers[0].0.features.len(), 1);
-        let expected_bytes = 9 * 516 + 527 + (4 + 12 + 10 * 512);
+        let expected_bytes = 9 * (TAG_OVERHEAD + 516) + (2 * TAG_OVERHEAD + 527) + (TAG_OVERHEAD + 16 + 10 * (ROLE_OVERHEAD + 512));
         let note = layers[0]
             .1
             .messages
@@ -1703,7 +1739,7 @@ pub(crate) mod tests {
         assert_eq!(
             note.as_str(),
             format!(
-                "OSM tag/role text reached the 1024-byte limit: 9 tagged nodes (tags dropped in points), 1 tagged way (omitted from lines/multipolygons), 1 relation (omitted from multipolygons) ({expected_bytes} bytes of text left out)"
+                "OSM tag/role text reached the 1800-byte limit: 9 tagged nodes (tags dropped in points), 1 tagged way (omitted from lines/multipolygons), 1 relation (omitted from multipolygons) ({expected_bytes} bytes of text left out)"
             )
         );
 
@@ -1731,8 +1767,139 @@ pub(crate) mod tests {
         field_bytes(1, &st, &mut route_prim);
         field_bytes(2, &route_pg, &mut route_prim);
         blob("OSMData", &route_prim, true, &mut route_out);
-        let route_osm = blocks_with_text_limit(&route_out, 1024).unwrap();
-        assert_eq!(route_osm.text_bytes, 0);
+        let route_osm = blocks_with_text_limit(&route_out, 1800).unwrap();
+        assert_eq!(route_osm.relation_text_bytes, 0);
         assert_eq!(route_osm.text_capped_relations, 0);
+    }
+
+    /// Zero-length `("", "")` tag pairs from string-table index 0 still charge per-tag overhead,
+    /// so they cannot allocate unbounded `(String, String)` entries at zero budget cost.
+    #[test]
+    fn zero_length_tags_still_hit_text_budget() {
+        let mut out = Vec::new();
+        let mut header = Vec::new();
+        field_bytes(4, b"OsmSchema-V0.6", &mut header);
+        field_bytes(4, b"DenseNodes", &mut header);
+        blob("OSMHeader", &header, false, &mut out);
+
+        let mut st = Vec::new();
+        for s in ["", "name", "ok"] {
+            field_bytes(1, s.as_bytes(), &mut st);
+        }
+        // Two dense nodes (first tagged so a points layer exists).
+        let mut dense = Vec::new();
+        field_bytes(1, &delta(&[1, 2]), &mut dense);
+        field_bytes(8, &delta(&[0, 1_000_000]), &mut dense);
+        field_bytes(9, &delta(&[0, 1_000_000]), &mut dense);
+        field_bytes(10, &packed_of(&[1, 2, 0, 0]), &mut dense);
+
+        // One way carrying 30 zero-length ("", "") tag pairs (30 * TAG_OVERHEAD = 1440 bytes).
+        let mut way = Vec::new();
+        field_varint(1, 200, &mut way);
+        field_bytes(2, &packed_of(&[0; 30]), &mut way);
+        field_bytes(3, &packed_of(&[0; 30]), &mut way);
+        field_bytes(8, &delta(&[1, 2]), &mut way);
+
+        let mut pg = Vec::new();
+        field_bytes(2, &dense, &mut pg);
+        field_bytes(3, &way, &mut pg);
+        let mut prim = Vec::new();
+        field_bytes(1, &st, &mut prim);
+        field_bytes(2, &pg, &mut prim);
+        blob("OSMData", &prim, true, &mut out);
+
+        // Total budget 3000 -> 1000-byte way share < 1440-byte zero-length tag overhead.
+        let layers = read_with_text_limit("empty-tags.osm.pbf", &out, 3000).unwrap();
+        assert_eq!(layers.len(), 1, "way with excess zero-length tags must be omitted");
+        let expected = 30 * TAG_OVERHEAD;
+        let note = layers[0]
+            .1
+            .messages
+            .iter()
+            .find(|m| m.loss == Some(crate::loss::LossCode::DroppedOverLimit))
+            .expect("must emit DroppedOverLimit notice for zero-length tags");
+        assert_eq!(
+            note.as_str(),
+            format!(
+                "OSM tag/role text reached the 3000-byte limit: 1 tagged way (omitted from lines/multipolygons) ({expected} bytes of text left out)"
+            )
+        );
+    }
+
+    /// Exhausting the node text budget early in a file must not starve tagged ways or drawn
+    /// relations that appear later.
+    #[test]
+    fn node_text_budget_does_not_starve_ways_or_relations() {
+        let mut out = Vec::new();
+        let mut header = Vec::new();
+        field_bytes(4, b"OsmSchema-V0.6", &mut header);
+        field_bytes(4, b"DenseNodes", &mut header);
+        blob("OSMHeader", &header, false, &mut out);
+
+        let big = "x".repeat(512);
+        let mut st = Vec::new();
+        for s in ["", "name", big.as_str(), "highway", "road", "type", "multipolygon", "outer"] {
+            field_bytes(1, s.as_bytes(), &mut st);
+        }
+        // Ten dense nodes (first 4 form a square for the relation), all with 512-byte names.
+        let ids: Vec<i64> = (1..=10).collect();
+        let lons = vec![0, 1_000_000, 1_000_000, 0, 2_000_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 7_000_000];
+        let lats = vec![0, 0, 1_000_000, 1_000_000, 0, 0, 0, 0, 0, 0];
+        let mut kv = Vec::new();
+        for _ in 0..10 {
+            kv.extend([1u64, 2, 0]);
+        }
+        let mut dense = Vec::new();
+        field_bytes(1, &delta(&ids), &mut dense);
+        field_bytes(8, &delta(&lats), &mut dense);
+        field_bytes(9, &delta(&lons), &mut dense);
+        field_bytes(10, &packed_of(&kv), &mut dense);
+
+        // Way 100: small tagged road (fits easily in way share).
+        let mut road = Vec::new();
+        field_varint(1, 100, &mut road);
+        field_bytes(2, &packed_of(&[3]), &mut road);
+        field_bytes(3, &packed_of(&[4]), &mut road);
+        field_bytes(8, &delta(&[5, 6]), &mut road);
+
+        // Way 101: untagged closed outer ring for relation 200.
+        let mut ring = Vec::new();
+        field_varint(1, 101, &mut ring);
+        field_bytes(8, &delta(&[1, 2, 3, 4, 1]), &mut ring);
+
+        // Relation 200: small multipolygon (fits easily in relation share).
+        let mut rel = Vec::new();
+        field_varint(1, 200, &mut rel);
+        field_bytes(2, &packed_of(&[5]), &mut rel);
+        field_bytes(3, &packed_of(&[6]), &mut rel);
+        field_bytes(8, &packed_of(&[7]), &mut rel);
+        field_bytes(9, &delta(&[101]), &mut rel);
+        field_bytes(10, &packed_of(&[1]), &mut rel);
+
+        let mut pg = Vec::new();
+        field_bytes(2, &dense, &mut pg);
+        field_bytes(3, &road, &mut pg);
+        field_bytes(3, &ring, &mut pg);
+        field_bytes(4, &rel, &mut pg);
+        let mut prim = Vec::new();
+        field_bytes(1, &st, &mut prim);
+        field_bytes(2, &pg, &mut prim);
+        blob("OSMData", &prim, true, &mut out);
+
+        // Budget 1800 -> 600 per kind: only 1 of 10 tagged nodes fits, but both road and
+        // multipolygon relation remain intact.
+        let layers = read_with_text_limit("isolated.osm.pbf", &out, 1800).unwrap();
+        assert_eq!(layers.len(), 3, "points, lines, and multipolygons must all be present");
+        assert_eq!(layers[0].0.features.len(), 1, "only 1 tagged node fits in node budget");
+        assert_eq!(layers[1].0.features.len(), 1, "tagged way must not be starved by nodes");
+        assert_eq!(layers[2].0.features.len(), 1, "multipolygon relation must not be starved by nodes");
+        let note = layers[0]
+            .1
+            .messages
+            .iter()
+            .find(|m| m.loss == Some(crate::loss::LossCode::DroppedOverLimit))
+            .expect("node cap notice must be emitted");
+        assert!(note.contains("9 tagged nodes (tags dropped in points)"), "{note:?}");
+        assert!(!note.contains("tagged way") && !note.contains("relation"), "{note:?}");
     }
 }

@@ -3289,6 +3289,11 @@ pub(crate) fn csv_cell(v: &Value) -> String {
     }
 }
 
+/// A CSV header name, prefixed with an apostrophe when it starts like a spreadsheet formula.
+pub(crate) fn csv_header(name: &str) -> String {
+    if csv_needs_guard(name) { format!("'{name}") } else { name.to_string() }
+}
+
 /// The names of a point layer's longitude and latitude columns in CSV: the first of the names
 /// reading takes for each that no field has, ignoring case and the spaces around a name (reading
 /// trims them).
@@ -3352,7 +3357,7 @@ impl<W: std::io::Write> CsvWriter<W> {
             // The coordinate columns come first, before any attributes using recognised names.
             head.extend(csv_names_in(fields, crs));
         }
-        head.extend(fields.iter().map(|f| f.name.clone()));
+        head.extend(fields.iter().map(|f| csv_header(&f.name)));
         w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
         Ok(CsvWriter { w, point })
     }
@@ -4893,19 +4898,8 @@ impl CsvLosses {
             let what = if self.unwritten == 1 { "1 feature".to_string() } else { format!("{} features", self.unwritten) };
             notes.push(format!("{target}: CSV holds a point a row, so the geometry of {what} wasn't written, only the attributes"));
         }
-        let total: usize = self.guarded.iter().sum();
-        if total > 0 {
-            let target: String = target.chars().map(dbf_notice_char).collect();
-            let values = if total == 1 { "value" } else { "values" };
-            let affected = fields
-                .iter()
-                .zip(&self.guarded)
-                .filter(|(_, n)| **n > 0)
-                .map(|(f, n)| format!("'{}' ({n})", dbf_notice_name(&f.name)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            notes.push(format!("{target}: CSV prefixed {total} text {values} with an apostrophe for spreadsheet protection in {affected}"));
-        }
+        notes.extend(csv_guarded_headers_note(fields, target));
+        notes.extend(csv_guarded_cells_note(fields, &self.guarded, target));
         notes
     }
 
@@ -5299,6 +5293,37 @@ pub fn export_losses_notes(ds: &Dataset, ext: &str, name_field: Option<usize>, t
     export_losses_notes_in(ds, ext, name_field, target, Crs::LonLat)
 }
 
+/// Notice for CSV/WKT CSV field names prefixed with an apostrophe for spreadsheet protection.
+fn csv_guarded_headers_note(fields: &[Field], target: &str) -> Option<String> {
+    let guarded: Vec<String> =
+        fields.iter().filter(|f| csv_needs_guard(&f.name)).map(|f| format!("'{}'", dbf_notice_name(&f.name))).collect();
+    if guarded.is_empty() {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let count = guarded.len();
+    let names = if count == 1 { "field name" } else { "field names" };
+    Some(format!("{target}: CSV prefixed {count} {names} with an apostrophe for spreadsheet protection ({})", guarded.join(", ")))
+}
+
+/// Notice for CSV/WKT CSV text cells prefixed with an apostrophe for spreadsheet protection.
+fn csv_guarded_cells_note(fields: &[Field], guarded: &[usize], target: &str) -> Option<String> {
+    let total: usize = guarded.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target: String = target.chars().map(dbf_notice_char).collect();
+    let values = if total == 1 { "value" } else { "values" };
+    let affected = fields
+        .iter()
+        .zip(guarded)
+        .filter(|(_, n)| **n > 0)
+        .map(|(f, n)| format!("'{}' ({n})", dbf_notice_name(&f.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{target}: CSV prefixed {total} text {values} with an apostrophe for spreadsheet protection in {affected}"))
+}
+
 /// As [`export_losses_notes`], for an export written in `crs`.
 pub fn export_losses_notes_in(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str, crs: Crs) -> Result<Vec<String>> {
     let mut notes = match ext {
@@ -5325,6 +5350,13 @@ pub fn export_losses_notes_in(ds: &Dataset, ext: &str, name_field: Option<usize>
             };
             let mut notes = losses.notes(&ds.fields, target);
             notes.extend(losses.coordinates_note_in(&ds.fields, target, crs));
+            notes
+        }
+        "wkt" => {
+            let mut notes = Vec::new();
+            notes.extend(csv_guarded_headers_note(&ds.fields, target));
+            let guarded_cells = CsvLosses::of(&ds.features, GeometryType::None, &ds.fields)?;
+            notes.extend(csv_guarded_cells_note(&ds.fields, &guarded_cells.guarded, target));
             notes
         }
         "kml" | "kmz" => kml_empty_fields_note(ds, target)?.into_iter().chain(kml_blank_names_note(ds, target)?).collect(),
