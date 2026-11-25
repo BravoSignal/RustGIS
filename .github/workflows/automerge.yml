@@ -61,7 +61,7 @@ jobs:
           # The token owner can't approve their own pull requests, and needn't: they bypass the review.
           if [ "$AUTHOR" != "$owner" ]; then
             gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/reviews" -f commit_id="$SHA" -f event=APPROVE \
-              --silent || { gh pr merge "$PR" --disable-auto; exit 1; }
+              -f body="Approved via automerge." --silent || { gh pr merge "$PR" --disable-auto; exit 1; }
           fi
 
   revoke:
@@ -78,13 +78,20 @@ jobs:
           ACTION: ${{ github.event.action }}
         run: |
           set -euo pipefail
+          if [ "$ACTION" = unlabeled ]; then
+            has_label=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER" --jq 'any(.labels[]; .name == "automerge")')
+            if [ "$has_label" = true ]; then
+              echo "automerge label was re-added before revoking; skipping."
+              exit 0
+            fi
+          fi
           gh pr merge "$PR" --disable-auto || echo "Auto-merge was off."
           if [ "$ACTION" = synchronize ]; then
             gh pr edit "$PR" --remove-label automerge
           elif [ "$ACTION" = unlabeled ]; then
             owner=$(gh api user --jq .login)
             gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/reviews?per_page=100" \
-              | jq -r --arg owner "$owner" '.[] | select((.user.login // "") == $owner and .state == "APPROVED") | .id' \
+              | jq -r --arg owner "$owner" '.[] | select((.user.login // "") == $owner and .state == "APPROVED" and (.body // "") == "Approved via automerge.") | .id' \
               | while read -r review_id; do
                   [ -n "$review_id" ] || continue
                   gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/reviews/$review_id/dismissals" \
