@@ -3269,7 +3269,7 @@ const FORMULA_START: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 /// Text needs an apostrophe if it starts like a spreadsheet formula. The numeric exception
 /// keeps finite numbers that fit Double precision and have at most 15 significant digits.
 /// A leading-zero code stays guarded unless its mantissa has digits after a decimal point.
-pub(crate) fn csv_needs_guard(text: &str) -> bool {
+fn csv_needs_guard(text: &str) -> bool {
     if !text.starts_with(FORMULA_START) {
         return false;
     }
@@ -3282,7 +3282,7 @@ pub(crate) fn csv_needs_guard(text: &str) -> bool {
 }
 
 /// A cell's file text, with an apostrophe when the spreadsheet guard applies.
-fn csv_cell(v: &Value) -> String {
+pub(crate) fn csv_cell(v: &Value) -> String {
     match v {
         Value::Text(t) if csv_needs_guard(t) => format!("'{t}"),
         other => other.to_file_text(),
@@ -5149,8 +5149,7 @@ impl TextLosses {
                     && !column.is_text()
                 {
                     let text = match ext {
-                        "csv" => csv_cell(v),
-                        "wkt" => crate::interop::wkt_csv_text(&v.to_file_text()),
+                        "csv" | "wkt" => csv_cell(v),
                         _ => v.to_file_text(),
                     };
                     // CSV's `<Null>` reads as null, so it types a column no more than an empty cell.

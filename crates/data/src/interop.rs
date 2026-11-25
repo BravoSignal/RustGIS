@@ -520,17 +520,10 @@ impl WktParser {
     }
 }
 
-/// A [`to_wkt_csv`] cell's text before quoting: text starting like a formula is prefixed with `'`
-/// so spreadsheets show it rather than run it.
-pub(crate) fn wkt_csv_text(s: &str) -> String {
-    if crate::io::csv_needs_guard(s) { format!("'{s}") } else { s.to_string() }
-}
-
 /// CSV with a `wkt` geometry column and every attribute; cancellable between features.
 pub fn to_wkt_csv(ds: &Dataset) -> crate::Result<String> {
     let q = |s: &str| {
-        let s = wkt_csv_text(s);
-        if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s }
+        if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
     };
     let mut out = String::from("wkt");
     for f in &ds.fields {
@@ -543,7 +536,7 @@ pub fn to_wkt_csv(ds: &Dataset) -> crate::Result<String> {
         out.push_str(&q(&f.geometry.as_ref().map(wkt).unwrap_or_default()));
         for v in &f.attrs {
             out.push(',');
-            out.push_str(&q(&v.to_file_text()));
+            out.push_str(&q(&crate::io::csv_cell(v)));
         }
         out.push('\n');
     }
@@ -613,10 +606,24 @@ mod tests {
     #[test]
     fn wkt_csv_formula_guard_matches_csv() {
         for guarded in ["=SUM(A1)", "@cmd", "\t=1", "\r+1", "+Inf", "-NaN", "+0123", "-007", "+1234567890123456", "-1234567890123456"] {
-            assert_eq!(wkt_csv_text(guarded), format!("'{guarded}"), "{guarded:?}");
+            assert_eq!(crate::io::csv_cell(&Value::Text(guarded.into())), format!("'{guarded}"), "{guarded:?}");
         }
         for plain in ["-12.5", "+42", "-0.5", "Paris"] {
-            assert_eq!(wkt_csv_text(plain), plain, "{plain:?}");
+            assert_eq!(crate::io::csv_cell(&Value::Text(plain.into())), plain, "{plain:?}");
         }
+        // Round-trip: field names like `+0123` stay unchanged, 16-digit negative integers stay
+        // Integer, and formula-like text values are guarded in the CSV output.
+        let mut ds =
+            Dataset::new("rt", GeometryType::Point, vec![Field::new("+0123", FieldType::Text), Field::new("big_id", FieldType::Integer)]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text("\t=1".into()), Value::Int(-1_234_567_890_123_456)]);
+        let csv = to_wkt_csv(&ds).unwrap();
+        assert!(csv.starts_with("wkt,+0123,big_id\n"), "header must stay unguarded: {csv}");
+        assert!(csv.contains("'\t=1,-1234567890123456\n"), "text guarded, integer unguarded: {csv}");
+        let (back, _) = crate::io::read_csv(&csv, "rt").unwrap();
+        let names: Vec<&str> = back.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["+0123", "big_id"]);
+        assert_eq!(back.fields[1].ty, FieldType::Integer);
+        assert_eq!(back.features[0].attrs[0], Value::Text("\t=1".into()));
+        assert_eq!(back.features[0].attrs[1], Value::Int(-1_234_567_890_123_456));
     }
 }

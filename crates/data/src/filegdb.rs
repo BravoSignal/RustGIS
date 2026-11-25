@@ -937,7 +937,6 @@ fn row_offsets(x: &[u8]) -> Result<Vec<(u64, usize)>> {
         Some(bits) => total.div_ceil(1024).min(bits.len().saturating_mul(8)),
     };
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let mut stored_before = 0usize;
     for block in 0..in_blocks {
         let present = bitmap.is_none_or(|bits| bits.get(block / 8).is_some_and(|b| b >> (block % 8) & 1 == 1));
@@ -961,13 +960,16 @@ fn row_offsets(x: &[u8]) -> Result<Vec<(u64, usize)>> {
                 continue;
             }
             if let Ok(offset) = usize::try_from(offset) {
-                if !seen.insert(offset) {
-                    return Err(bad("duplicate row offset"));
-                }
                 out.push((row as u64 + 1, offset));
             }
         }
     }
+    // Check for duplicate offsets in place without allocating an auxiliary hash set.
+    out.sort_unstable_by_key(|&(_, offset)| offset);
+    if out.windows(2).any(|w| matches!(w, [(_, a), (_, b)] if a == b)) {
+        return Err(bad("duplicate row offset"));
+    }
+    out.sort_unstable_by_key(|&(row, _)| row);
     Ok(out)
 }
 

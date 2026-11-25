@@ -266,7 +266,7 @@ fn read_with_max_faces(file_name: &str, bytes: &[u8], crs: Option<Crs>, max_face
         [] => {}
         [one] => report.messages.push(crate::loss::Note::loss(
             crate::loss::LossCode::DroppedOverLimit,
-            format!("surface '{one}' has more than {max_faces} faces: the {faces_left_out} past the limit are left out"),
+            format!("the file has more than {max_faces} faces: the {faces_left_out} past the limit are left out, from surface '{one}' on"),
         )),
         many => {
             let shown: Vec<String> = many.iter().take(10).map(|n| format!("'{n}'")).collect();
@@ -274,7 +274,7 @@ fn read_with_max_faces(file_name: &str, bytes: &[u8], crs: Option<Crs>, max_face
             report.messages.push(crate::loss::Note::loss(
                 crate::loss::LossCode::DroppedOverLimit,
                 format!(
-                    "{} surfaces ({}{more}) have more than {max_faces} faces: the {faces_left_out} past the limit are left out",
+                    "the file has more than {max_faces} faces: the {faces_left_out} past the limit are left out, across {} surfaces ({}{more})",
                     many.len(),
                     shown.join(", ")
                 ),
@@ -521,9 +521,31 @@ mod tests {
         </Surfaces></LandXML>"#;
         let layers = read_with_max_faces("two.xml", two_surfaces.as_bytes(), None, 4).unwrap();
         assert_eq!(layers[0].0.features.len(), 4, "file-wide face cap must bound sibling surfaces");
-        assert!(
-            layers[0].1.messages.iter().any(|m| m.loss == Some(crate::loss::LossCode::DroppedOverLimit) && m.contains("2 past the limit"))
-        );
+        assert!(layers[0].1.messages.iter().any(|m| {
+            m.loss == Some(crate::loss::LossCode::DroppedOverLimit)
+                && m.as_str() == "the file has more than 4 faces: the 2 past the limit are left out, from surface 'b' on"
+        }));
+
+        let three_surfaces = r#"<LandXML><CoordinateSystem epsgCode="4326"/><Surfaces>
+            <Surface name="a"><Definition surfType="TIN">
+                <Pnts><P id="1">0 0 1</P><P id="2">0 1 1</P><P id="3">1 0 1</P></Pnts>
+                <Faces><F>1 2 3</F><F>1 2 3</F><F>1 2 3</F></Faces>
+            </Definition></Surface>
+            <Surface name="b"><Definition surfType="TIN">
+                <Pnts><P id="1">0 0 2</P><P id="2">0 1 2</P><P id="3">1 0 2</P></Pnts>
+                <Faces><F>1 2 3</F><F>1 2 3</F></Faces>
+            </Definition></Surface>
+            <Surface name="c"><Definition surfType="TIN">
+                <Pnts><P id="1">0 0 3</P><P id="2">0 1 3</P><P id="3">1 0 3</P></Pnts>
+                <Faces><F>1 2 3</F><F>1 2 3</F></Faces>
+            </Definition></Surface>
+        </Surfaces></LandXML>"#;
+        let layers = read_with_max_faces("three.xml", three_surfaces.as_bytes(), None, 4).unwrap();
+        assert_eq!(layers[0].0.features.len(), 4);
+        assert!(layers[0].1.messages.iter().any(|m| {
+            m.loss == Some(crate::loss::LossCode::DroppedOverLimit)
+                && m.as_str() == "the file has more than 4 faces: the 3 past the limit are left out, across 2 surfaces ('b', 'c')"
+        }));
     }
 
     #[test]
