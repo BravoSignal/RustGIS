@@ -1,10 +1,9 @@
 //! Browser file-picker extension filters, shared with `ui-egui` so desktop and browser filters
 //! cannot drift.
 
-pub(crate) use rustgis_ui_egui::{ITEM_EXTS, PROJECT_EXTS};
+use rustgis_ui_egui::{ITEM_EXTS, PROJECT_EXTS};
 
 /// Returns the static extension filter list for a named picker `purpose`, when it uses one.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn filter_extensions(purpose: &str) -> Option<&'static [&'static str]> {
     match purpose {
         "project" => Some(PROJECT_EXTS),
@@ -22,5 +21,6 @@ mod tests {
     fn browser_picker_extensions_match_ui_egui_lists() {
         assert_eq!(filter_extensions("project"), Some(rustgis_ui_egui::PROJECT_EXTS));
         assert_eq!(filter_extensions("item"), Some(rustgis_ui_egui::ITEM_EXTS));
+        assert_eq!(filter_extensions("unknown"), None);
     }
 }

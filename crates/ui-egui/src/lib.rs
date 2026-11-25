@@ -2632,6 +2632,8 @@ impl RustGisApp {
         let item = [
             (".geolibre", "project.importGeolibre"),
             (".geolibre.json", "project.importGeolibre"),
+            (".qgs", "project.importQgis"),
+            (".qgz", "project.importQgis"),
             (".rgismap", "map.import"),
             (".rgismpk", "map.import"),
             (".rgislyr", "layer.addLayerFile"),
@@ -10245,6 +10247,23 @@ mod peer_output_tests {
         }
         for ext in std::iter::once(&"rgislayout").chain(modelbuilder::MODEL_EXTS.iter()) {
             assert!(ITEM_EXTS.contains(ext), "ITEM_EXTS is missing .{ext}");
+        }
+    }
+
+    /// Opening a `.qgs` or `.qgz` file from bytes without a pending picker command (as browser
+    /// Open Project and drag-and-drop do) routes directly to `project.importQgis`.
+    #[test]
+    fn open_bytes_routes_qgis_projects_to_import_qgis() {
+        let qgs = r#"<qgis projectname="Browser QGIS"><title>Browser QGIS</title><projectlayers/></qgis>"#;
+        let qgz = rustgis_engine::data::zip::write(&[("demo.qgs".into(), qgs.as_bytes().to_vec())]).unwrap();
+
+        for (file_name, bytes) in [("demo.qgs", qgs.as_bytes()), ("demo.qgz", qgz.as_slice())] {
+            let mut app = RustGisApp::new(Session::new(Project::default()));
+            let maps_before = app.session.project.maps.len();
+            assert!(app.ui.pending_open.is_none());
+            app.open_bytes_with(file_name, bytes, None).unwrap_or_else(|e| panic!("{file_name}: {e}"));
+            assert_eq!(app.session.project.maps.len(), maps_before + 1, "{file_name} must import a new map");
+            assert_eq!(app.session.map().name, "Browser QGIS", "{file_name}");
         }
     }
 }

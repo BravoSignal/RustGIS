@@ -406,6 +406,43 @@ fn dataset(v: &Value, fallback: &str) -> Result<(rustgis_data::Dataset, rustgis_
     rustgis_data::io::read_geojson(&gj.to_string(), name).map_err(|e| format!("{name}: {e}"))
 }
 
+/// Formats a group of notices collected across one or more outputs (identified by output index)
+/// into a single notice with output count, names, and distinct details.
+fn format_grouped_notice(tool: &str, entries: &[(usize, String, String)]) -> String {
+    const SHOWN: usize = 3;
+    if let [(_, name, detail)] = entries {
+        return format!("{name}: {detail}");
+    }
+    let mut outputs: Vec<(usize, &str)> = Vec::new();
+    for (idx, name, _) in entries {
+        if !outputs.iter().any(|(seen, _)| seen == idx) {
+            outputs.push((*idx, name.as_str()));
+        }
+    }
+    let mut details: Vec<&str> = Vec::new();
+    for (_, _, d) in entries {
+        if !details.contains(&d.as_str()) {
+            details.push(d.as_str());
+        }
+    }
+    let detail_text = if details.len() <= SHOWN {
+        details.join("; ")
+    } else {
+        format!("{}; and {} more", details[..SHOWN].join("; "), details.len() - SHOWN)
+    };
+    if let [(_, only)] = outputs.as_slice() {
+        format!("{only}: {} notices: {detail_text}", entries.len())
+    } else {
+        let listed = if outputs.len() <= SHOWN {
+            outputs.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(", ")
+        } else {
+            let first = outputs[..SHOWN].iter().map(|(_, n)| *n).collect::<Vec<_>>().join(", ");
+            format!("{first}, and {} more", outputs.len() - SHOWN)
+        };
+        format!("{tool}: {} outputs ({listed}): {detail_text}", outputs.len())
+    }
+}
+
 /// Turns a tool's reply into a result: new `layers` and `tables`, or a `selection`
 /// (`{"layer": name, "rows": [...]}`), with `messages`.
 fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
@@ -424,59 +461,49 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
         return Ok(ToolResult { losses: Vec::new(), output: Output::Selection { layer, rows }, messages });
     }
     let mut outs = Vec::new();
-    let mut grouped_losses: Vec<(rustgis_data::loss::LossCode, Vec<(String, String)>)> = Vec::new();
-    let mut push_report = |name: &str, report: rustgis_data::ReadReport| {
+    let mut grouped_losses: Vec<(rustgis_data::loss::LossCode, Vec<(usize, String, String)>)> = Vec::new();
+    let mut grouped_plain: Vec<(String, Vec<(usize, String, String)>)> = Vec::new();
+    let mut output_idx = 0usize;
+    let mut push_report = |idx: usize, name: &str, report: rustgis_data::ReadReport| {
         for note in report.messages {
             match note.loss {
                 Some(code) => {
                     if let Some((_, entries)) = grouped_losses.iter_mut().find(|(c, _)| *c == code) {
-                        entries.push((name.to_string(), note.text));
+                        entries.push((idx, name.to_string(), note.text));
                     } else {
-                        grouped_losses.push((code, vec![(name.to_string(), note.text)]));
+                        grouped_losses.push((code, vec![(idx, name.to_string(), note.text)]));
                     }
                 }
-                None => messages.push(note.prefixed(name).text),
+                None => {
+                    if let Some((_, entries)) = grouped_plain.iter_mut().find(|(t, _)| *t == note.text) {
+                        entries.push((idx, name.to_string(), note.text));
+                    } else {
+                        let key = note.text.clone();
+                        grouped_plain.push((key, vec![(idx, name.to_string(), note.text)]));
+                    }
+                }
             }
         }
     };
     for v in reply.get("layers").and_then(Value::as_array).into_iter().flatten().take(64) {
         let (ds, report) = dataset(v, tool)?;
-        push_report(&ds.name, report);
+        push_report(output_idx, &ds.name, report);
+        output_idx += 1;
         outs.push(OutputLayer::Vector(ds));
     }
     for v in reply.get("tables").and_then(Value::as_array).into_iter().flatten().take(64) {
         let (ds, report) = dataset(v, tool)?;
-        push_report(&ds.name, report);
+        push_report(output_idx, &ds.name, report);
+        output_idx += 1;
         outs.push(OutputLayer::Table(ds));
     }
     let losses = grouped_losses
         .into_iter()
-        .map(|(code, entries)| {
-            const SHOWN: usize = 3;
-            let text = if let [(name, detail)] = entries.as_slice() {
-                format!("{name}: {detail}")
-            } else {
-                let mut names: Vec<&str> = Vec::new();
-                for (name, _) in &entries {
-                    if !names.contains(&name.as_str()) {
-                        names.push(name.as_str());
-                    }
-                }
-                let detail = entries.first().map_or("", |(_, d)| d.as_str());
-                if let [only] = names.as_slice() {
-                    format!("{only}: {} notices: {detail}", entries.len())
-                } else {
-                    let listed = if names.len() <= SHOWN {
-                        names.join(", ")
-                    } else {
-                        format!("{}, and {} more", names[..SHOWN].join(", "), names.len() - SHOWN)
-                    };
-                    format!("{tool}: {} outputs ({listed}): {detail}", names.len())
-                }
-            };
-            rustgis_data::loss::LossMessage { code, text }
-        })
+        .map(|(code, entries)| rustgis_data::loss::LossMessage { code, text: format_grouped_notice(tool, &entries) })
         .collect();
+    for (_, entries) in grouped_plain {
+        messages.push(format_grouped_notice(tool, &entries));
+    }
     Ok(ToolResult { losses, output: Output::Layers(outs), messages })
 }
 
@@ -595,10 +622,49 @@ mod tests {
         );
         let crs = res.losses.iter().find(|l| l.code == rustgis_data::loss::LossCode::AssumedCrs).expect("AssumedCrs loss");
         assert!(
-            crs.text.contains("2 outputs (Peaks, Summary)"),
-            "expected grouped count and output names for AssumedCrs, got: {}",
+            crs.text.contains("2 outputs (Peaks, Summary)") && crs.text.contains("CUSTOM::999") && crs.text.contains("CUSTOM::888"),
+            "expected grouped count, output names, and both distinct CRS details for AssumedCrs, got: {}",
             crs.text
         );
         assert!(res.messages.is_empty(), "classified losses belong in losses only: {:?}", res.messages);
+
+        // Unnamed outputs share the fallback tool name, but each output is still counted accurately.
+        let unnamed = json!({
+            "layers": [
+                {"geojson": {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [10.0, 50.0, 1.0]}}]}},
+                {"geojson": {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [11.0, 51.0, 2.0]}}]}},
+                point_3d("Peaks", None),
+            ]
+        });
+        let res = output(&unnamed, "demo").unwrap();
+        assert_eq!(res.losses.len(), 1, "{:?}", res.losses);
+        assert!(
+            res.losses[0].text.contains("3 outputs (demo, demo, Peaks)"),
+            "two unnamed outputs plus Peaks must count as 3 outputs, got: {}",
+            res.losses[0].text
+        );
+
+        // Plain (unclassified) GeoJSON notes (e.g. IAU planetocentric CRS) are grouped across outputs too.
+        let mars_layer = |name: &str| {
+            json!({
+                "name": name,
+                "geojson": {
+                    "type": "FeatureCollection",
+                    "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:IAU_2015::49900"}},
+                    "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [10.0, 20.0]}}]
+                }
+            })
+        };
+        let plain = json!({
+            "layers": [mars_layer("MarsA"), mars_layer("MarsB"), mars_layer("MarsC")]
+        });
+        let res = output(&plain, "demo").unwrap();
+        assert!(res.losses.is_empty(), "IAU planetocentric note is plain, not a loss: {:?}", res.losses);
+        assert_eq!(res.messages.len(), 1, "identical plain notes across outputs must group into 1 message: {:?}", res.messages);
+        assert!(
+            res.messages[0].contains("3 outputs (MarsA, MarsB, MarsC)") && res.messages[0].contains("IAU_2015::49900"),
+            "expected grouped plain note with count and output names, got: {}",
+            res.messages[0]
+        );
     }
 }
