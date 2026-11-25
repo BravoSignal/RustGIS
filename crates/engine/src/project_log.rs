@@ -75,7 +75,9 @@ pub(crate) fn is_logged(s: &Session, id: &str, params: &Value) -> bool {
 /// each giving up more: texts at that bound and lists at their first [`LOG_LIST_ITEMS`]; then
 /// texts at 512 characters; then the first keys with their short values only.
 pub(crate) fn kept_params(params: &Value) -> Value {
-    let v = redacted(&clip(params, LOG_PARAMS_BYTES, LOG_LIST_ITEMS, 0, true));
+    // Scrub active logins and S3 wrappers before clipping so a secret spanning LOG_PARAMS_BYTES
+    // cannot leave a recognizable prefix behind.
+    let v = redacted(&clip(&scrub_log_value(params.clone(), 0), LOG_PARAMS_BYTES, LOG_LIST_ITEMS, 0, true));
     if serde_json::to_vec(&v).map_or(0, |b| b.len()) <= LOG_PARAMS_BYTES {
         return v;
     }

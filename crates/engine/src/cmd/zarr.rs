@@ -599,6 +599,9 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
                 && let Some(l) = s.map_mut().layer_mut(id)
             {
                 l.anonymous = true;
+                if let Some(rl) = l.raster.as_mut() {
+                    rl.anonymous = true;
+                }
             }
             Ok(out)
         }
@@ -1480,6 +1483,9 @@ fn add_following(s: &mut Session, p: &Value, asked: Option<Asked>) -> CmdResult 
             && let Some(l) = s.map_mut().layer_mut(id)
         {
             l.anonymous = true;
+            if let Some(rl) = l.raster.as_mut() {
+                rl.anonymous = true;
+            }
         }
         let said: Vec<String> = window_notes.into_iter().chain(part).collect();
         for w in &said {

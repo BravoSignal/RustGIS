@@ -1000,6 +1000,24 @@ fn anonymous_reads_suppress_implicit_s3_and_sign_in_credentials() {
         }
     }
 
+    // 3c. Non-in-place anonymous S3 raster reload must pass rustgis-anonymous: to fetch_whole
+    // so s3::prepare never signs with an active S3 connection.
+    {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_cb = captured.clone();
+        rustgis_data::source::remote::set_fetcher(move |url, _want, done| {
+            cap_cb.lock().unwrap_or_else(|e| e.into_inner()).push(url.to_string());
+            done(Err(rustgis_data::source::remote::Failed::Other("captured".into())));
+        });
+        let mut rl = rustgis_map::raster::RasterLayer::unread_in_place("s3://priv-bkt-anon/whole-reload.tif").with_anonymous(true);
+        rl.in_place = false;
+        rl.reload().unwrap();
+        let urls = captured.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(urls.as_slice(), ["rustgis-anonymous:s3://priv-bkt-anon/whole-reload.tif"]);
+        let prep = crate::render::rustgis_tiles::s3::prepare(&urls[0]).unwrap();
+        assert!(!prep.signed && prep.anonymous && prep.headers.is_empty(), "{prep:?}");
+    }
+
     // 4. request_params strips rustgis-s3: capability wrappers under anonymous mode.
     let wrapped = rustgis_data::s3_address::bind("0123456789abcdef", "https://s3.example.org", "s3://priv-bkt-anon/key.geojson").unwrap();
     let p = json!({"url": wrapped});
@@ -1087,7 +1105,7 @@ fn plugin_address_hold_scans_nested_legend_urls_and_bounds_work() {
     forward(&mut s, "plug-net-nested", "map.setTiles", json!({"name": "Base", "legend": [{"url": public_legend}]})).unwrap();
     assert_eq!(cache::ceiling_for(public_legend), Reach::Public);
 
-    // Large numeric and coordinate-pair arrays do not trip the node limit, while still scanning strings inside.
+    // Large numeric, coordinate-pair, and non-address object/ID arrays pass while still scanning strings inside.
     let mut coords: Vec<Value> = (0..5000).map(|i| json!([f64::from(i) * 0.01, f64::from(i) * -0.01])).collect();
     forward(
         &mut s,
@@ -1096,14 +1114,31 @@ fn plugin_address_hold_scans_nested_legend_urls_and_bounds_work() {
         json!({"name": "Base", "legend": [{"url": public_legend}], "extra": coords.clone()}),
     )
     .unwrap();
+    let mut features: Vec<Value> = (0..5000).map(|i| json!({"id": format!("feat-{i}"), "name": "parcel"})).collect();
+    forward(
+        &mut s,
+        "plug-net-nested",
+        "map.setTiles",
+        json!({"name": "Base", "legend": [{"url": public_legend}], "features": features.clone()}),
+    )
+    .unwrap();
     coords.push(json!([0.0, "http://127.0.0.1:8080/hidden.png"]));
     let err =
         forward(&mut s, "plug-net-nested", "map.addTiles", json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "extra": coords}))
             .unwrap_err();
     assert!(err.contains("this computer or the local network"), "{err}");
+    features.push(json!({"id": "hidden", "href": "http://127.0.0.1:8080/hidden-feat.png"}));
+    let err = forward(
+        &mut s,
+        "plug-net-nested",
+        "map.addTiles",
+        json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "features": features}),
+    )
+    .unwrap_err();
+    assert!(err.contains("this computer or the local network"), "{err}");
 
-    // Overly large nested string/container payloads fail closed rather than bypassing the scan.
-    let mut pad: Vec<Value> = (0..4100).map(|i| json!(format!("item-{i}"))).collect();
+    // Exceeding the web-address cap fails closed rather than skipping remaining addresses.
+    let mut pad: Vec<Value> = (0..4100).map(|i| json!(format!("https://tiles.example.org/{i}.png"))).collect();
     pad.push(json!("http://127.0.0.1:8080/hidden.png"));
     let err = forward(&mut s, "plug-net-nested", "map.addTiles", json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "extra": pad}))
         .unwrap_err();
@@ -1197,6 +1232,16 @@ fn project_log_scrubs_active_logins_and_s3_wrappers() {
     assert!(!logged.contains(&active_secret), "log_params leaked active login: {logged}");
     assert!(!logged.contains("rustgis-s3:"), "log_params leaked s3 wrapper: {logged}");
     assert!(!logged.contains(&s3_tok), "log_params leaked wrapped query token: {logged}");
+
+    // An active login spanning LOG_PARAMS_BYTES (4096) in params must be scrubbed before clipping.
+    let param_pad = "p".repeat(crate::project_log::LOG_PARAMS_BYTES - 8);
+    let clipped_param = crate::log_params(&json!({
+        "note": format!("{param_pad}{active_secret}tail"),
+    }))
+    .into_log_value()
+    .to_string();
+    assert!(!clipped_param.contains(&active_secret), "clipped log_params leaked active login: {clipped_param}");
+    assert!(!clipped_param.contains(&active_secret[..8]), "clipped log_params leaked active login prefix: {clipped_param}");
 
     // Deeply nested containers (depth >= 8) must omit contents so active logins (including ones
     // with quotes or backslashes that JSON escaping would alter) and S3 wrappers cannot survive.

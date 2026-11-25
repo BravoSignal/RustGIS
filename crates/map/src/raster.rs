@@ -676,6 +676,7 @@ impl RasterLayer {
                 .next()
                 .unwrap_or("raster.tif")
                 .to_string();
+            let fetch_path = self.fetch_address().unwrap_or(std::borrow::Cow::Borrowed(path)).into_owned();
             let placement = self.placement;
             // A PDF's page, read again from the download.
             let page = self.subdataset.clone();
@@ -685,7 +686,7 @@ impl RasterLayer {
             self.data = None;
             self.opening = Some(slot);
             rustgis_data::source::remote::fetch_whole(
-                path,
+                &fetch_path,
                 Box::new(move |result| {
                     let result = remote::check_still(&still)
                         .and(result.map_err(|e| match e {
@@ -3615,5 +3616,17 @@ mod tests {
         rl.data = Some(Arc::new(r));
         let CastShadows::Unavailable(why) = rl.sky_view(true, (0, 1), || {}) else { panic!("said") };
         assert!(why.contains("sky visibility") && why.contains("read in place"), "{why}");
+    }
+
+    #[test]
+    fn anonymous_fetch_address_wraps_plain_and_is_idempotent() {
+        let plain = RasterLayer::unread_in_place("s3://bucket/scene.tif");
+        assert_eq!(plain.fetch_address().as_deref(), Some("s3://bucket/scene.tif"));
+
+        let anon = RasterLayer::unread_in_place("s3://bucket/scene.tif").with_anonymous(true);
+        assert_eq!(anon.fetch_address().as_deref(), Some("rustgis-anonymous:s3://bucket/scene.tif"));
+
+        let already = RasterLayer::unread_in_place("rustgis-anonymous:s3://bucket/scene.tif").with_anonymous(true);
+        assert_eq!(already.fetch_address().as_deref(), Some("rustgis-anonymous:s3://bucket/scene.tif"));
     }
 }

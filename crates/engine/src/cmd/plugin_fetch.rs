@@ -236,53 +236,68 @@ impl Session {
     }
 }
 
-/// The most string, object, and non-primitive array nodes inspected when scanning a plugin
-/// command's parameters for web addresses.
-const MAX_ADDRESS_SCAN_NODES: usize = 4096;
+/// The most web address strings accepted in one plugin command's parameters.
+const MAX_ADDRESS_SCAN_ADDRESSES: usize = 4096;
 
-/// The most total array elements scanned across nested arrays (including pure-primitive coordinate
-/// lists) so hostile gigantic payloads still fail closed.
+/// The most total JSON values scanned across nested arrays and objects when searching a plugin
+/// command's parameters for web addresses so hostile gigantic payloads still fail closed.
 const MAX_ADDRESS_SCAN_ELEMENTS: usize = 1_000_000;
 
 /// The web addresses among a command's own parameters, not inside the contents of a file it
-/// gives (`data`, `text`). Walks nested arrays and objects iteratively, skipping primitive leaves
-/// and pure-primitive arrays (such as `[x, y]` coordinate pairs) from the
-/// [`MAX_ADDRESS_SCAN_NODES`] count while bounding total scanned array elements at
-/// [`MAX_ADDRESS_SCAN_ELEMENTS`]; overly complex parameters are refused rather than skipped.
+/// gives (`data`, `text`). Walks nested arrays and objects iteratively, bounding total scanned
+/// JSON values at [`MAX_ADDRESS_SCAN_ELEMENTS`] (1,000,000) and discovered web address strings at
+/// [`MAX_ADDRESS_SCAN_ADDRESSES`] (4,096); payloads past either limit are refused rather than
+/// skipped so large non-address inputs (inline geometries, feature collections, ID lists) pass
+/// while every string inside them is still inspected.
 fn web_addresses(params: &Value) -> Result<Vec<&str>, String> {
+    web_addresses_within(params, MAX_ADDRESS_SCAN_ELEMENTS, MAX_ADDRESS_SCAN_ADDRESSES)
+}
+
+fn web_addresses_within(params: &Value, max_elements: usize, max_addresses: usize) -> Result<Vec<&str>, String> {
     let Some(o) = params.as_object() else { return Ok(Vec::new()) };
     let is_primitive = |v: &Value| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null);
-    let mut stack: Vec<&Value> =
-        o.iter().filter(|(key, v)| !matches!(key.as_str(), "data" | "text") && !is_primitive(v)).map(|(_, v)| v).collect();
-    let mut out = Vec::new();
-    let mut visited = 0usize;
+    let mut stack: Vec<&Value> = Vec::new();
     let mut elements = 0usize;
-    while let Some(v) = stack.pop() {
-        if is_primitive(v) {
+    for (key, v) in o {
+        if matches!(key.as_str(), "data" | "text") {
             continue;
         }
-        if let Value::Array(a) = v {
-            elements = elements.saturating_add(a.len());
-            if elements > MAX_ADDRESS_SCAN_ELEMENTS {
-                return Err("command parameters are too complex for a plugin network check".into());
-            }
-            if a.iter().all(is_primitive) {
-                continue;
-            }
+        elements = elements.saturating_add(1);
+        if elements > max_elements {
+            return Err(format!("command parameters are too complex for a plugin network check (over {max_elements} values)"));
         }
-        visited += 1;
-        if visited > MAX_ADDRESS_SCAN_NODES {
-            return Err("command parameters are too complex for a plugin network check".into());
+        if !is_primitive(v) {
+            stack.push(v);
         }
+    }
+    let mut out = Vec::new();
+    while let Some(v) = stack.pop() {
         match v {
             Value::String(s) => {
                 let s = s.trim();
                 if is_web_address(s) {
+                    if out.len() >= max_addresses {
+                        return Err(format!(
+                            "command parameters are too complex for a plugin network check (over {max_addresses} web addresses)"
+                        ));
+                    }
                     out.push(s);
                 }
             }
-            Value::Array(a) => stack.extend(a.iter().filter(|x| !is_primitive(x))),
-            Value::Object(m) => stack.extend(m.values().filter(|x| !is_primitive(x))),
+            Value::Array(a) => {
+                elements = elements.saturating_add(a.len());
+                if elements > max_elements {
+                    return Err(format!("command parameters are too complex for a plugin network check (over {max_elements} values)"));
+                }
+                stack.extend(a.iter().filter(|x| !is_primitive(x)));
+            }
+            Value::Object(m) => {
+                elements = elements.saturating_add(m.len());
+                if elements > max_elements {
+                    return Err(format!("command parameters are too complex for a plugin network check (over {max_elements} values)"));
+                }
+                stack.extend(m.values().filter(|x| !is_primitive(x)));
+            }
             _ => {}
         }
     }
@@ -1768,5 +1783,20 @@ mod tests {
         }
         assert!(c.entries.iter().map(|e| e.size).sum::<usize>() <= CACHE_BYTES);
         assert!(c.get("https://cache.test/big39").is_some());
+    }
+
+    #[test]
+    fn web_addresses_within_bounds_elements_and_addresses() {
+        let ok_params = json!({"ids": ["a", "b", "c"], "url": "https://example.org/a.png"});
+        let ok = web_addresses_within(&ok_params, 10, 2).unwrap();
+        assert_eq!(ok, vec!["https://example.org/a.png"]);
+
+        let many_elements = json!({"ids": [1, 2, 3, 4, 5, 6]});
+        let too_many_elements = web_addresses_within(&many_elements, 5, 10).unwrap_err();
+        assert!(too_many_elements.contains("over 5 values"), "{too_many_elements}");
+
+        let many_urls = json!({"urls": ["https://a.example/1", "https://a.example/2", "https://a.example/3"]});
+        let too_many_urls = web_addresses_within(&many_urls, 50, 2).unwrap_err();
+        assert!(too_many_urls.contains("over 2 web addresses"), "{too_many_urls}");
     }
 }

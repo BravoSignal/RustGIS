@@ -559,6 +559,9 @@ pub(crate) fn mark_service_source(s: &mut Session, r: &Value, url: &str) {
             l.dataset.source = Some(url.to_string());
             if anonymous {
                 l.anonymous = true;
+                if let Some(rl) = l.raster.as_mut() {
+                    rl.anonymous = true;
+                }
                 l.connection.clear();
             }
         }

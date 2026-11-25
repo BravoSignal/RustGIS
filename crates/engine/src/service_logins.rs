@@ -1318,6 +1318,9 @@ pub(crate) fn tag(s: &mut Session, params: &Value, before: Before, out: &Value) 
             added.insert(l.id);
             if anonymous || l.anonymous {
                 l.anonymous = true;
+                if let Some(rl) = l.raster.as_mut() {
+                    rl.anonymous = true;
+                }
                 l.connection.clear();
                 continue;
             }
