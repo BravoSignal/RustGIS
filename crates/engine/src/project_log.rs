@@ -214,6 +214,7 @@ fn scrub_log_value(v: Value, depth: usize) -> Value {
         Value::Object(o) if depth < 8 => {
             Value::Object(o.into_iter().map(|(k, x)| (scrub_log_text(&k), scrub_log_value(x, depth + 1))).collect())
         }
+        container @ (Value::Array(_) | Value::Object(_)) => Value::String(scrub_log_text(&container.to_string())),
         other => other,
     }
 }

@@ -244,10 +244,15 @@ const MAX_ADDRESS_SCAN_NODES: usize = 4096;
 /// [`MAX_ADDRESS_SCAN_NODES`] nodes; overly complex parameters are refused rather than skipped.
 fn web_addresses(params: &Value) -> Result<Vec<&str>, String> {
     let Some(o) = params.as_object() else { return Ok(Vec::new()) };
-    let mut stack: Vec<&Value> = o.iter().filter(|(key, _)| !matches!(key.as_str(), "data" | "text")).map(|(_, v)| v).collect();
+    let is_primitive = |v: &Value| matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null);
+    let mut stack: Vec<&Value> =
+        o.iter().filter(|(key, v)| !matches!(key.as_str(), "data" | "text") && !is_primitive(v)).map(|(_, v)| v).collect();
     let mut out = Vec::new();
     let mut visited = 0usize;
     while let Some(v) = stack.pop() {
+        if is_primitive(v) {
+            continue;
+        }
         visited += 1;
         if visited > MAX_ADDRESS_SCAN_NODES {
             return Err("command parameters are too complex for a plugin network check".into());
@@ -259,8 +264,8 @@ fn web_addresses(params: &Value) -> Result<Vec<&str>, String> {
                     out.push(s);
                 }
             }
-            Value::Array(a) => stack.extend(a.iter()),
-            Value::Object(m) => stack.extend(m.values()),
+            Value::Array(a) => stack.extend(a.iter().filter(|x| !is_primitive(x))),
+            Value::Object(m) => stack.extend(m.values().filter(|x| !is_primitive(x))),
             _ => {}
         }
     }

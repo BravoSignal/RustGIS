@@ -1072,8 +1072,18 @@ fn plugin_address_hold_scans_nested_legend_urls_and_bounds_work() {
     forward(&mut s, "plug-net-nested", "map.setTiles", json!({"name": "Base", "legend": [{"url": public_legend}]})).unwrap();
     assert_eq!(cache::ceiling_for(public_legend), Reach::Public);
 
-    // Overly large nested payloads fail closed rather than bypassing the address scan.
-    let mut pad: Vec<Value> = (0..4100).map(|i| json!(i)).collect();
+    // Large numeric arrays do not trip the node limit, while still scanning any strings inside.
+    let mut nums: Vec<Value> = (0..4100).map(|i| json!(i)).collect();
+    forward(&mut s, "plug-net-nested", "map.setTiles", json!({"name": "Base", "legend": [{"url": public_legend}], "extra": nums.clone()}))
+        .unwrap();
+    nums.push(json!("http://127.0.0.1:8080/hidden.png"));
+    let err =
+        forward(&mut s, "plug-net-nested", "map.addTiles", json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "extra": nums}))
+            .unwrap_err();
+    assert!(err.contains("this computer or the local network"), "{err}");
+
+    // Overly large nested string/container payloads fail closed rather than bypassing the scan.
+    let mut pad: Vec<Value> = (0..4100).map(|i| json!(format!("item-{i}"))).collect();
     pad.push(json!("http://127.0.0.1:8080/hidden.png"));
     let err = forward(&mut s, "plug-net-nested", "map.addTiles", json!({"url": "https://tiles.example.org/{z}/{x}/{y}.png", "extra": pad}))
         .unwrap_err();
@@ -1167,6 +1177,16 @@ fn project_log_scrubs_active_logins_and_s3_wrappers() {
     assert!(!logged.contains(&active_secret), "log_params leaked active login: {logged}");
     assert!(!logged.contains("rustgis-s3:"), "log_params leaked s3 wrapper: {logged}");
     assert!(!logged.contains(&s3_tok), "log_params leaked wrapped query token: {logged}");
+
+    // Deeply nested containers (depth >= 8) must still scrub active logins and S3 wrappers.
+    let mut deep = json!({ format!("k-{active_secret}"): format!("{active_secret} {wrapped}") });
+    for _ in 0..10 {
+        deep = json!({"nested": [deep]});
+    }
+    let deep_logged = crate::log_params(&deep).into_log_value().to_string();
+    assert!(!deep_logged.contains(&active_secret), "deep log_params leaked active login: {deep_logged}");
+    assert!(!deep_logged.contains("rustgis-s3:"), "deep log_params leaked s3 wrapper: {deep_logged}");
+    assert!(!deep_logged.contains(&s3_tok), "deep log_params leaked wrapped token: {deep_logged}");
 
     // Failed command errors recorded in the session log must also scrub active logins and wrappers.
     let _ = s.run("layer.rename", &json!({"layer": format!("missing {active_secret} {wrapped}")}));
