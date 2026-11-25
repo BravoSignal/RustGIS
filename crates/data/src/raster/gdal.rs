@@ -485,9 +485,11 @@ fn valid_crs(c: &str) -> bool {
     let proj = c.starts_with("+proj=")
         && c.chars().all(|ch| ch.is_ascii_alphanumeric() || " +=_.,-".contains(ch))
         && c.split_whitespace().all(|token| {
-            token.strip_prefix('+').is_some_and(|kv| {
-                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-                !k.is_empty() && !super::crs::proj_key_refused(k, v)
+            token.strip_prefix('+').is_some_and(|rest| {
+                rest.split('+').all(|kv| {
+                    let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                    !k.is_empty() && !super::crs::proj_key_refused(k, v)
+                })
             })
         });
     let urn = up.starts_with("URN:OGC:DEF:CRS:") && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ":._-".contains(ch));
@@ -752,6 +754,7 @@ mod tests {
             "+proj=utm +zone=33 +vgrids=egm96_15.gtx",
             "+proj=deformation +xy_grids=a.tif",
             "+proj=merc nadgrids=foo.gsb",
+            "+proj=merc+nadgrids=foo.gsb",
             "+proj=defmodel +model=foo.json",
             "+proj=tinshift +file=foo.json",
             "+proj=hgridshift",

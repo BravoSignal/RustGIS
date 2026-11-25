@@ -422,13 +422,14 @@ pub fn bare_vn2000_error(text: &str) -> String {
 /// `xy_grids`, `z_grids`, `gridlist`…), so a grid key PROJ adds later is refused too.
 fn validate_proj_string(proj4: &str) -> Result<(), String> {
     for token in proj4.split_whitespace() {
-        let t = token.trim_start_matches('+');
-        let (key, val) = t.split_once('=').unwrap_or((t, ""));
-        if proj_key_refused(key, val) {
-            return Err(format!("parameter '+{t}' is not allowed in coordinate system definition"));
-        }
-        if val.contains("..") || val.contains('/') || val.contains('\\') {
-            return Err("file path in parameter is not allowed in coordinate system definition".into());
+        for part in token.trim_start_matches('+').split('+') {
+            let (key, val) = part.split_once('=').unwrap_or((part, ""));
+            if proj_key_refused(key, val) {
+                return Err(format!("parameter '+{part}' is not allowed in coordinate system definition"));
+            }
+            if val.contains("..") || val.contains('/') || val.contains('\\') {
+                return Err("file path in parameter is not allowed in coordinate system definition".into());
+            }
         }
     }
     Ok(())
@@ -3458,6 +3459,7 @@ mod tests {
             "+proj=pipeline +step +proj=utm +zone=33",
             "+PROJ=Pipeline +step +proj=utm +zone=33",
             "+proj=merc nadgrids=foo.gsb",
+            "+proj=merc+nadgrids=foo.gsb",
             "+proj=defmodel +model=foo.json",
             "+proj=tinshift",
             "+proj=hgridshift",
