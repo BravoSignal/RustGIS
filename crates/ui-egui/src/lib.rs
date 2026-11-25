@@ -3265,27 +3265,48 @@ impl RustGisApp {
     pub fn open_peer_text(&mut self, text: &str) -> Result<(), String> {
         let report = self.session.open_peer_text(rustgis_engine::Peer::Embedder, text)?;
         assistantpane::peer_replaced(self);
-        self.ui.web_file = None;
-        self.map.deleting = None;
-        // A spectral profile's points were read on the old project's rasters.
-        self.workflow.spectral.clear();
-        crate::analysispane::forget_similar(&mut self.workflow);
-        (self.workflow.result, self.workflow.error) = (None, None);
-        self.retire_cog_probes();
-        if let Some(steps) = self.ws.recording.take() {
-            self.session.notify(
-                crate::i18n::fmt(
-                    "Recording stopped: another project opened, and its {n} steps were for the previous one.",
-                    &[("n", &steps.len().to_string())],
-                ),
-                true,
-            );
-        }
-        layoutview::follow_project(self);
+        self.reset_after_project_replace();
         for notice in report.notices() {
             self.session.notify(notice, false);
         }
         Ok(())
+    }
+
+    /// Resets transient UI and editing state tied to the replaced project, shared by ordinary
+    /// project-replacement commands and peer project replacement.
+    fn reset_after_project_replace(&mut self) {
+        self.map.cancel_sketch();
+        pluginpanel::cancel_pick(self);
+        crate::vertexedit::cancel_stale_drag(self);
+        annotation::sync(self);
+        crate::boxedit::cancel_stale(self);
+        crate::circleedit::cancel_stale(self);
+        if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
+            self.ui.symbology_pending = None;
+        }
+        // A project replacing this one hasn't been saved in the browser yet (opening a file
+        // names it again).
+        self.ui.web_file = None;
+        // A deletion asked for in the old project never reaches a namesake in the new one.
+        self.map.deleting = None;
+        // Nor are a spectral profile's points read on a namesake raster of the new one.
+        self.workflow.spectral.clear();
+        crate::analysispane::forget_similar(&mut self.workflow);
+        (self.workflow.result, self.workflow.error) = (None, None);
+        // A recording's steps name the old project's layers: it ends here, and says so.
+        if let Some(steps) = self.ws.recording.take() {
+            let n = steps.len().to_string();
+            let text =
+                crate::i18n::fmt("Recording stopped: another project opened, and its {n} steps were for the previous one.", &[("n", &n)]);
+            self.session.notify(text, true);
+        }
+        // A probe still under way is for an address added to the old project: dropped, so
+        // its layer never lands in the new one, and said, as a download landing late is. A plugin
+        // command waiting for it went with the old project's waits.
+        self.retire_cog_probes();
+        self.ws.task_edit = None;
+        table::prune_views(self);
+        layoutview::follow_project(self);
     }
 
     /// Reports pending header reads retired by either ordinary or peer project replacement.
@@ -3530,29 +3551,8 @@ impl RustGisApp {
         if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
             self.ui.symbology_pending = None;
         }
-        // A project replacing this one hasn't been saved in the browser yet (opening a file
-        // names it again).
         if r.is_ok() && matches!(id, "project.new" | "project.sample" | "project.open" | "project.openText" | "project.fromTemplate") {
-            self.ui.web_file = None;
-            // A deletion asked for in the old project never reaches a namesake in the new one.
-            self.map.deleting = None;
-            // Nor are a spectral profile's points read on a namesake raster of the new one.
-            self.workflow.spectral.clear();
-            crate::analysispane::forget_similar(&mut self.workflow);
-            (self.workflow.result, self.workflow.error) = (None, None);
-            // A recording's steps name the old project's layers: it ends here, and says so.
-            if let Some(steps) = self.ws.recording.take() {
-                let n = steps.len().to_string();
-                let text = crate::i18n::fmt(
-                    "Recording stopped: another project opened, and its {n} steps were for the previous one.",
-                    &[("n", &n)],
-                );
-                self.session.notify(text, true);
-            }
-            // A probe still under way is for an address added to the old project: dropped, so
-            // its layer never lands in the new one, and said, as a download landing late is. A plugin
-            // command waiting for it went with the old project's waits.
-            self.retire_cog_probes();
+            self.reset_after_project_replace();
         }
         // Fields and layers can go while the table is closed: its column views follow them.
         table::prune_views(self);
@@ -10133,6 +10133,76 @@ mod peer_output_tests {
                 assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.text.contains("project was closed")).count(), 3);
             }
         }
+    }
+
+    /// Peer project replacement clears active map sketches, shape drags, plugin picks, pending
+    /// symbology, attribute-table views and in-progress task step edits just like User replacement.
+    #[test]
+    fn peer_project_replacement_clears_editing_and_transient_ui_state() {
+        let mut app = RustGisApp::with_sample();
+        let (text, _) = Project::default().saved_text(None).unwrap();
+        let shapes = app.session.map_mut().add_dataset(rustgis_engine::data::Dataset::new(
+            "Shapes",
+            rustgis_engine::data::GeometryType::Polygon,
+            vec![rustgis_engine::data::Field::new("kind", rustgis_engine::data::FieldType::Text)],
+        ));
+        app.session.active_layer = Some(shapes);
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        let layer_ref = app.session.map().layer(shapes).unwrap();
+        let instance = layer_ref.instance_id();
+        app.ui.symbology_pending = Some(PendingUniqueSymbology::new(&app.session, layer_ref, "kind".into()));
+        app.ui.plugin_panel.set_picking_for_tests("demo", "extent");
+        app.ws.task_edit = Some((0, "Step".into(), "Instructions".into()));
+        app.table.seed_view_for_tests(app.session.opened, instance);
+
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 700.0)).with_max_steps(32).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        // Start a real map sketch point and a real box-edit drag.
+        h.state_mut().run("tool.set", json!({"tool": "measure"})).unwrap();
+        h.run_steps(2);
+        let view = h.state().map.view_rect.unwrap().0;
+        let at = view.center();
+        h.event(egui::Event::PointerMoved(at));
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+        h.run_steps(2);
+        assert_eq!(h.state().map.sketch_len(), 1);
+
+        h.state_mut().run("tool.set", json!({"tool": "rotatedBox"})).unwrap();
+        // Put the sketch point back via measure? Actually test sketch and box separately via open_peer_text.
+        assert!(crate::boxedit::drag_start(h.state_mut(), view, at, true));
+        crate::boxedit::drag_to(h.state_mut(), view, at + egui::vec2(40.0, 40.0), false);
+        assert!(crate::boxedit::drawing(h.state()));
+        // Re-set plugin pick since tool.set cleared it.
+        h.state_mut().ui.plugin_panel.set_picking_for_tests("demo", "extent");
+        assert!(h.state().ui.plugin_panel.is_picking_for_tests());
+
+        h.state_mut().open_peer_text(&text).unwrap();
+        assert!(!crate::boxedit::drawing(h.state()), "open_peer_text must cancel active box drag");
+        assert!(!h.state().ui.plugin_panel.is_picking_for_tests(), "open_peer_text must cancel plugin panel pick");
+        assert!(h.state().ui.symbology_pending.is_none(), "open_peer_text must clear stale symbology_pending");
+        assert!(h.state().ws.task_edit.is_none(), "open_peer_text must clear ws.task_edit");
+        assert!(!h.state().table.has_views_for_tests(), "open_peer_text must prune old table views");
+
+        // Also verify an active map sketch is cancelled by open_peer_text.
+        h.state_mut().run("tool.set", json!({"tool": "measure"})).unwrap();
+        h.run_steps(2);
+        h.event(egui::Event::PointerMoved(at));
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        }
+        h.run_steps(2);
+        assert_eq!(h.state().map.sketch_len(), 1);
+        h.state_mut().open_peer_text(&text).unwrap();
+        assert_eq!(h.state().map.sketch_len(), 0, "open_peer_text must cancel active map sketch");
     }
 }
 

@@ -1366,29 +1366,12 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             } else if purpose == "shapefile" {
                 rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {
-                rfd::AsyncFileDialog::new().add_filter(
-                    rustgis_ui_egui::tl!("Projects and JSON data (RustGIS, GeoLibre)"),
-                    &["rgis", "rgisx", "rgispkg", "geolibre", "json"],
-                )
+                rfd::AsyncFileDialog::new()
+                    .add_filter(rustgis_ui_egui::tl!("Projects and JSON data (RustGIS, QGIS, GeoLibre)"), crate::picker::PROJECT_EXTS)
             } else if purpose == "qgisProject" {
                 rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("QGIS project"), &["qgs", "qgz"])
             } else if purpose == "item" {
-                rfd::AsyncFileDialog::new().add_filter(
-                    "RustGIS items",
-                    &[
-                        "rgismap",
-                        "rgismpk",
-                        "rgispkg",
-                        "rgislyr",
-                        "rgisstyle",
-                        "rgisramp",
-                        "rgistemplate",
-                        "rgistask",
-                        "rgisbookmarks",
-                        "rgis",
-                        "rgisx",
-                    ],
-                )
+                rfd::AsyncFileDialog::new().add_filter("RustGIS items", crate::picker::ITEM_EXTS)
             } else if purpose == "ramp" {
                 rfd::AsyncFileDialog::new().add_filter("Colour ramps", &["rgisramp", "xml", "qml", "txt", "clr", "cpt"])
             } else if purpose == "layout" {

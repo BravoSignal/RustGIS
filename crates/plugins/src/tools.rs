@@ -397,20 +397,19 @@ pub fn file_extensions(tool: &str, param: &str) -> Vec<String> {
 }
 
 /// Reads a dataset a tool returned: `{"name": "...", "geojson": {FeatureCollection}}`.
-fn dataset(v: &Value, fallback: &str) -> Result<rustgis_data::Dataset, String> {
+fn dataset(v: &Value, fallback: &str) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
     let name = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()).unwrap_or(fallback);
     let gj = v.get("geojson").ok_or_else(|| format!("{name}: an output has no 'geojson'"))?;
     if gj.get("features").and_then(Value::as_array).is_some_and(|f| f.len() > MAX_FEATURES) {
         return Err(format!("{name}: too many features"));
     }
-    let (ds, _) = rustgis_data::io::read_geojson(&gj.to_string(), name).map_err(|e| format!("{name}: {e}"))?;
-    Ok(ds)
+    rustgis_data::io::read_geojson(&gj.to_string(), name).map_err(|e| format!("{name}: {e}"))
 }
 
 /// Turns a tool's reply into a result: new `layers` and `tables`, or a `selection`
 /// (`{"layer": name, "rows": [...]}`), with `messages`.
 fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
-    let messages: Vec<String> = reply
+    let mut messages: Vec<String> = reply
         .get("messages")
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).take(200).map(str::to_string).collect())
@@ -425,13 +424,26 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
         return Ok(ToolResult { losses: Vec::new(), output: Output::Selection { layer, rows }, messages });
     }
     let mut outs = Vec::new();
+    let mut losses = Vec::new();
+    let mut push_report = |name: &str, report: rustgis_data::ReadReport| {
+        for note in report.messages.prefixed(name) {
+            match note.loss {
+                Some(code) => losses.push(rustgis_data::loss::LossMessage { code, text: note.text }),
+                None => messages.push(note.text),
+            }
+        }
+    };
     for v in reply.get("layers").and_then(Value::as_array).into_iter().flatten().take(64) {
-        outs.push(OutputLayer::Vector(dataset(v, tool)?));
+        let (ds, report) = dataset(v, tool)?;
+        push_report(&ds.name, report);
+        outs.push(OutputLayer::Vector(ds));
     }
     for v in reply.get("tables").and_then(Value::as_array).into_iter().flatten().take(64) {
-        outs.push(OutputLayer::Table(dataset(v, tool)?));
+        let (ds, report) = dataset(v, tool)?;
+        push_report(&ds.name, report);
+        outs.push(OutputLayer::Table(ds));
     }
-    Ok(ToolResult { losses: Vec::new(), output: Output::Layers(outs), messages })
+    Ok(ToolResult { losses, output: Output::Layers(outs), messages })
 }
 
 #[cfg(test)]
@@ -469,5 +481,66 @@ mod tests {
         let f = picked["features"].as_array().unwrap();
         assert_eq!(f.len(), 1);
         assert!(near(&f[0], 11.6, 48.8), "{picked}");
+    }
+
+    /// GeoJSON loss notices from plugin tool outputs (layers and tables) reach `ToolResult.losses`
+    /// (and unclassified notices reach `ToolResult.messages`), while clean outputs emit none.
+    #[test]
+    fn plugin_tool_output_propagates_geojson_loss_notices_and_stays_clean_when_lossless() {
+        let clean = json!({
+            "layers": [{
+                "name": "Clean",
+                "geojson": {
+                    "type": "FeatureCollection",
+                    "features": [{"type": "Feature", "properties": {"a": 1}, "geometry": {"type": "Point", "coordinates": [10.0, 50.0]}}]
+                }
+            }],
+            "tables": [{
+                "name": "CleanTable",
+                "geojson": {
+                    "type": "FeatureCollection",
+                    "features": [{"type": "Feature", "properties": {"b": 2}, "geometry": null}]
+                }
+            }]
+        });
+        let res = output(&clean, "demo").unwrap();
+        assert!(res.losses.is_empty(), "clean output must have no losses: {:?}", res.losses);
+        assert!(res.messages.is_empty(), "clean output must have no messages: {:?}", res.messages);
+
+        let lossy = json!({
+            "layers": [{
+                "name": "Peaks",
+                "geojson": {
+                    "type": "FeatureCollection",
+                    "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:CUSTOM::999"}},
+                    "features": [{"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [10.0, 50.0, 1200.0]}}]
+                }
+            }],
+            "tables": [{
+                "name": "Summary",
+                "geojson": {
+                    "type": "FeatureCollection",
+                    "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:CUSTOM::888"}},
+                    "features": [{"type": "Feature", "properties": {"n": 1}, "geometry": null}]
+                }
+            }]
+        });
+        let res = output(&lossy, "demo").unwrap();
+        assert!(
+            res.losses.iter().any(|l| l.code == rustgis_data::loss::LossCode::DroppedZm && l.text.starts_with("Peaks: ")),
+            "expected DroppedZm loss for Peaks: {:?}",
+            res.losses
+        );
+        assert!(
+            res.losses.iter().any(|l| l.code == rustgis_data::loss::LossCode::AssumedCrs && l.text.starts_with("Peaks: ")),
+            "expected AssumedCrs loss for Peaks: {:?}",
+            res.losses
+        );
+        assert!(
+            res.losses.iter().any(|l| l.code == rustgis_data::loss::LossCode::AssumedCrs && l.text.starts_with("Summary: ")),
+            "expected AssumedCrs loss for Summary: {:?}",
+            res.losses
+        );
+        assert!(res.messages.is_empty(), "classified losses belong in losses only: {:?}", res.messages);
     }
 }
