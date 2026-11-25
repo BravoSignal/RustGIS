@@ -487,10 +487,17 @@ fn boxed(item: Node, kind: &str, dir: &str, layer: &str, read: &mut Reading, rep
         read.no_picture += 1;
         return Vec::new();
     }
+    let picture = match super::source::local_image_source(path, dir) {
+        Ok(super::source::ImageSource::Base64) => path.to_string(),
+        Ok(super::source::ImageSource::File(p)) => p,
+        Err(why) => {
+            report.skipped(layer, format!("picture annotations {why}"));
+            return Vec::new();
+        }
+    };
     if fixed {
         read.pictures_fixed += 1;
     }
-    let picture = if path.starts_with("base64:") { path.to_string() } else { super::source::absolute(path, dir) };
     out.extend(background.map(wrap));
     let g = Graphic::new("picture", rect());
     out.push(Annotation { graphic: g, picture: Some(picture), keep_aspect: item.attribute("lockAspect") != Some("0") });

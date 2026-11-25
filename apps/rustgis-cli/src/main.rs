@@ -554,6 +554,7 @@ fn ask(s: &mut Session, args: &[String], saved: Option<&Saved>, env: &Environmen
     let pictures = ask_pictures(args)?;
     eprintln!("[{} · {}]", cfg.provider, cfg.model);
     let yes = args.iter().any(|a| a == "--yes");
+    let trace_key = cfg.key.clone();
     let mut a = Agent::new(cfg, s);
     a.set_skills(rustgis_assistant::skills::installed());
     let mut shown = 0;
@@ -577,13 +578,8 @@ fn ask(s: &mut Session, args: &[String], saved: Option<&Saved>, env: &Environmen
     let send = |req: &rustgis_assistant::HttpRequest| {
         let r = transport(req);
         if let Some(path) = &trace {
-            let resp = match &r {
-                Ok(r) => format!("HTTP {}\n{}", r.status, String::from_utf8_lossy(&r.body)),
-                Err(e) => e.to_string(),
-            };
-            let entry = format!("> {} {}\n{}\n< {resp}\n\n", req.method, req.url, req.body.as_deref().unwrap_or(""));
-            let written = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(entry.as_bytes()));
-            if let Err(e) = written {
+            let entry = format_trace_entry(req, &r, &trace_key);
+            if let Err(e) = append_trace(path, &entry) {
                 eprintln!("rustgis-cli: {}: {e}", path.display());
             }
         }
@@ -604,6 +600,41 @@ fn ask(s: &mut Session, args: &[String], saved: Option<&Saved>, env: &Environmen
         return Err("the assistant couldn't finish".into());
     }
     Ok(())
+}
+
+/// Scrubs active service login values and the assistant's own API key from trace text.
+fn mask_trace_secrets(text: &str, key: &str) -> String {
+    let scrubbed = rustgis_engine::render::rustgis_tiles::logins::scrub(text);
+    if key.is_empty() { scrubbed } else { scrubbed.replace(key, "[redacted]") }
+}
+
+/// Formats a `--trace` entry for an assistant request and its response, redacting URL
+/// credentials, secret fields, active service logins, and the configured API key.
+fn format_trace_entry<E: std::fmt::Display>(
+    req: &rustgis_assistant::HttpRequest,
+    resp: &Result<rustgis_assistant::HttpResponse, E>,
+    key: &str,
+) -> String {
+    let url = mask_trace_secrets(&rustgis_engine::sources::redact(&req.url), key);
+    let body = mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(req.body.as_deref().unwrap_or("")), key);
+    let answer = match resp {
+        Ok(r) => format!(
+            "HTTP {}\n{}",
+            r.status,
+            mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(&String::from_utf8_lossy(&r.body)), key)
+        ),
+        Err(e) => mask_trace_secrets(&rustgis_engine::data::diagnostics::redact(&e.to_string()), key),
+    };
+    format!("> {} {url}\n{body}\n< {answer}\n\n", req.method)
+}
+
+/// Appends `entry` to the `--trace` file, restricting new files to owner-only permissions on Unix.
+fn append_trace(path: &std::path::Path, entry: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(entry.as_bytes())
 }
 
 /// `--attach [PORT]` as `mcp` takes it: the port that follows when it isn't another flag, else
@@ -1308,5 +1339,55 @@ mod tests {
             let _ = ask(&mut s, &args(management), Some(&opted_in), &env);
         }
         assert!(store.accounts().is_empty(), "asked for {:?}", store.accounts());
+    }
+
+    #[test]
+    fn trace_entry_scrubs_secrets_and_urls() {
+        let origin = "https://trace-login.example.test";
+        let binding = rustgis_engine::render::rustgis_tiles::logins::activate(
+            origin,
+            "trace",
+            rustgis_engine::render::rustgis_tiles::logins::Method::Header("X-Key".into()),
+            "active-login-secret-999",
+            false,
+        )
+        .unwrap();
+        let req = rustgis_assistant::HttpRequest {
+            method: "POST",
+            url: "https://user:urlpw@api.example.test/v1/chat?key=sk-test-key-12345&model=m".into(),
+            headers: Vec::new(),
+            body: Some(r#"{"prompt":"check postgres://dbu:dbpw@db.example/gis and sk-test-key-12345 and active-login-secret-999"}"#.into()),
+        };
+        let resp: Result<_, &str> = Ok(rustgis_assistant::HttpResponse {
+            status: 400,
+            headers: Vec::new(),
+            body: br#"{"error":"invalid key sk-test-key-12345 at https://u:respw@api.example.test?token=resptok"}"#.to_vec(),
+        });
+        let entry = format_trace_entry(&req, &resp, "sk-test-key-12345");
+        let err_entry = format_trace_entry(
+            &req,
+            &Err("failed calling https://u:errpw@api.example.test?api_key=errkey with sk-test-key-12345 and active-login-secret-999"),
+            "sk-test-key-12345",
+        );
+        assert!(rustgis_engine::render::rustgis_tiles::logins::deactivate(&binding));
+        for secret in ["urlpw", "sk-test-key-12345", "dbpw", "respw", "resptok", "active-login-secret-999"] {
+            assert!(!entry.contains(secret), "leaked {secret} in: {entry}");
+        }
+        assert!(entry.contains("HTTP 400") && entry.contains("\"prompt\""), "{entry}");
+        for secret in ["urlpw", "sk-test-key-12345", "errpw", "errkey", "active-login-secret-999"] {
+            assert!(!err_entry.contains(secret), "leaked {secret} in: {err_entry}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_uses_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("rustgis-cli-trace-mode-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        append_trace(&path, "entry\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
     }
 }

@@ -3347,3 +3347,34 @@ fn a_dropped_virtual_filter_is_not_noted_for_letter_case() {
     assert!(report.notes.iter().any(|n| n.layer == "v" && n.text.contains("too long to read together")), "{:?}", report.notes);
     assert_eq!(letter_case_notes(&report, "v"), 0, "{:?}", report.notes);
 }
+
+#[test]
+fn picture_annotations_reject_unsafe_paths() {
+    let cases = [
+        (r"\\server\share\a.png", "/d", "network share"),
+        ("//server/share/a.png", "/d", "network share"),
+        (r"/\server\share\a.png", "/d", "network share"),
+        (r"\/server/share/a.png", "/d", "network share"),
+        ("C:relative.png", "/d", "drive's working folder"),
+        ("https://example.com/a.png", "/d", "web address"),
+        ("file:///etc/passwd.png", "/d", "web address"),
+        ("attachment:a.png", "/d", ".qgz project"),
+        ("relative.png", "", "folder the import wasn't given"),
+    ];
+    for (path, dir, expected_note) in cases {
+        let qgs = format!(
+            r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></projectCrs><projectlayers>
+            <maplayer type="annotation"><id>a</id><layername>Pics</layername><items>
+              <item type="picture" path="{path}" xMin="0" yMin="0" xMax="1" yMax="1"/>
+            </items></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        let p = read_project(&qgs, dir, &mut report).unwrap();
+        assert!(p.layers[0].annotations.is_empty(), "{path} (dir={dir:?}) produced {:?}", p.layers[0].annotations);
+        assert!(
+            report.notes.iter().any(|n| n.layer == "Pics" && n.kind == NoteKind::Skipped && n.text.contains(expected_note)),
+            "{path}: {:?}",
+            report.notes
+        );
+    }
+}

@@ -993,24 +993,29 @@ fn add_annotations(
                 Some(Ok(b64)) if b64.len() > left => None,
                 Some(read) => Some(read.clone()),
                 None => {
-                    // Its size first, from its text or its file's length (base64 is 4 bytes for 3):
-                    // one that can't fit isn't read.
-                    let size = match picture.strip_prefix("base64:") {
-                        Some(b64) => Some(b64.trim().len()),
-                        None => std::fs::metadata(picture)
-                            .ok()
-                            .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX).div_ceil(3).saturating_mul(4)),
-                    };
-                    let read = if !has_dir && picture.strip_prefix("base64:").is_none() && qgis::is_relative(picture) {
-                        Err(format!("{picture}, relative to the project's folder, which the import wasn't given (pass dir)"))
-                    } else if size.is_some_and(|size| size > left) {
-                        pictures.over.insert(picture.clone());
-                        over += 1;
-                        continue;
-                    } else if let Some(b64) = picture.strip_prefix("base64:") {
-                        super::graphics::picture(&json!({"image": b64}))
-                    } else {
-                        super::graphics::picture(&json!({"path": picture}))
+                    let read = match qgis::local_image_source(picture, if has_dir { "/" } else { "" }) {
+                        Err(why) => Err(format!("{picture}: {why}")),
+                        Ok(source) => {
+                            // Its size first, from its text or its file's length (base64 is 4 bytes for 3):
+                            // one that can't fit isn't read.
+                            let size = match &source {
+                                qgis::ImageSource::Base64 => Some(picture.strip_prefix("base64:").unwrap_or_default().trim().len()),
+                                qgis::ImageSource::File(_) => std::fs::metadata(picture)
+                                    .ok()
+                                    .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX).div_ceil(3).saturating_mul(4)),
+                            };
+                            if size.is_some_and(|size| size > left) {
+                                pictures.over.insert(picture.clone());
+                                over += 1;
+                                continue;
+                            }
+                            match source {
+                                qgis::ImageSource::Base64 => {
+                                    super::graphics::picture(&json!({"image": picture.strip_prefix("base64:").unwrap_or_default()}))
+                                }
+                                qgis::ImageSource::File(_) => super::graphics::picture(&json!({"path": picture})),
+                            }
+                        }
                     };
                     if read.as_ref().is_ok_and(|b64| b64.len() > left) {
                         pictures.over.insert(picture.clone());
@@ -2099,4 +2104,58 @@ fn import_style(s: &mut Session, p: &Value) -> CmdResult {
     }
     notify_report(s, &report);
     Ok(json!({"notes": report.notes.iter().map(note_json).collect::<Vec<_>>()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_annotations_refuses_unsafe_picture_paths_defensively() {
+        let mut s = Session::new(crate::Project::default());
+        let rect = rustgis_data::Geometry::Polygon(vec![vec![vec![
+            rustgis_geom::Coord::new(0.0, 0.0),
+            rustgis_geom::Coord::new(1.0, 0.0),
+            rustgis_geom::Coord::new(1.0, 1.0),
+            rustgis_geom::Coord::new(0.0, 1.0),
+            rustgis_geom::Coord::new(0.0, 0.0),
+        ]]]);
+        let layer = qgis::ProjectLayer {
+            id: "a".into(),
+            name: "Direct".into(),
+            provider: String::new(),
+            kind: "annotation".into(),
+            vector: false,
+            visible: true,
+            checked: true,
+            group: None,
+            definition_query: None,
+            crs: Some("EPSG:4326".into()),
+            source: qgis::Source::Other { provider: String::new() },
+            style: qgis::Style::default(),
+            annotations: vec![
+                qgis::Annotation {
+                    graphic: rustgis_map::graphics::Graphic::new("picture", rect.clone()),
+                    picture: Some(r"\\server\share\a.png".into()),
+                    keep_aspect: false,
+                },
+                qgis::Annotation {
+                    graphic: rustgis_map::graphics::Graphic::new("picture", rect.clone()),
+                    picture: Some(r"/\server\share\b.png".into()),
+                    keep_aspect: false,
+                },
+                qgis::Annotation {
+                    graphic: rustgis_map::graphics::Graphic::new("picture", rect),
+                    picture: Some("C:rel.png".into()),
+                    keep_aspect: false,
+                },
+            ],
+        };
+        let mut pictures = Pictures::default();
+        let mut report = Report::default();
+        add_annotations(&mut s, &layer, Some("EPSG:4326"), None, true, &mut pictures, &mut report).unwrap();
+        let added = s.map().layer_by_name("Direct").unwrap();
+        assert!(added.dataset.features.is_empty());
+        assert!(report.notes.iter().any(|n| n.text.contains("network share")), "{:?}", report.notes);
+    }
 }

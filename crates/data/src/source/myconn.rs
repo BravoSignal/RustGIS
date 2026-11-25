@@ -15,7 +15,9 @@ pub fn split_password(s: &str) -> Option<(String, Option<String>)> {
     if !is_address(t) {
         return None;
     }
-    split_userinfo_password(t)
+    let (mut public, password) = split_userinfo_password(t)?;
+    super::credentials::redact_query(&mut public);
+    Some((public, password))
 }
 
 /// Removes user-info and query passwords without restricting the address's scheme.
@@ -64,7 +66,7 @@ fn query_without_password(s: &str) -> (String, Option<String>) {
     let mut kept = Vec::new();
     for kv in query.split('&').filter(|kv| !kv.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-        if k.eq_ignore_ascii_case("password") || k.eq_ignore_ascii_case("pass") {
+        if matches!(crate::address::normalized_name(k).as_deref(), Some("password" | "pass")) {
             password = Some(super::pgconn::percent_decode(v));
         } else {
             kept.push(kv);
@@ -112,5 +114,22 @@ mod tests {
         assert_eq!(database_name("mysql://me@h:3306/my%20db?x=1").as_deref(), Some("my db"));
         assert_eq!(database_name("mysql://h"), None);
         assert_eq!(database_name("mysql://h/"), None);
+    }
+
+    #[test]
+    fn encoded_password_and_secret_query_params_are_stripped() {
+        let s = |a: &str| split_password(a).unwrap_or_else(|| panic!("{a}"));
+        assert_eq!(
+            s("mysql://me@h/gis?pass%77ord=sec%26ret&ssl-mode=REQUIRED"),
+            ("mysql://me@h/gis?ssl-mode=REQUIRED".into(), Some("sec&ret".into()))
+        );
+        assert_eq!(
+            s("mariadb://me@h/gis?pa%73s=pw123&ssl-mode=REQUIRED"),
+            ("mariadb://me@h/gis?ssl-mode=REQUIRED".into(), Some("pw123".into()))
+        );
+        for key in ["token", "access_token", "client_secret", "api_key", "pwd"] {
+            let (public, _) = s(&format!("mysql://me@h/gis?{key}=secret&ssl-mode=REQUIRED"));
+            assert_eq!(public, "mysql://me@h/gis?ssl-mode=REQUIRED", "{key}");
+        }
     }
 }

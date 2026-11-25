@@ -17,7 +17,7 @@ pub fn split_password(s: &str) -> Option<(String, Option<String>)> {
         let (_, query) = public.split_once('?')?;
         query.split('&').find_map(|kv| {
             let (key, value) = kv.split_once('=')?;
-            (key.eq_ignore_ascii_case("pwd") || key.eq_ignore_ascii_case("passwd")).then(|| super::pgconn::percent_decode(value))
+            matches!(crate::address::normalized_name(key).as_deref(), Some("pwd" | "passwd")).then(|| super::pgconn::percent_decode(value))
         })
     });
     super::credentials::redact_query(&mut public);
@@ -59,6 +59,8 @@ mod tests {
             ("pwd=ignored&password=chosen", "chosen"),
             ("passwd=ignored&pass=chosen", "chosen"),
             ("pwd=&passwd=second", ""),
+            ("pw%64=encoded-pwd", "encoded-pwd"),
+            ("pass%77d=encoded-passwd", "encoded-passwd"),
         ] {
             let (public, password) = split_password(&format!("mssql://sa@h/gis?{query}&encrypt=strict")).unwrap();
             assert_eq!(password.as_deref(), Some(expected), "{query}");

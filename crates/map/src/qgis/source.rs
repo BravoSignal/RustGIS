@@ -1019,6 +1019,40 @@ pub fn is_drive_relative(path: &str) -> bool {
     b.get(1) == Some(&b':') && b.first().is_some_and(u8::is_ascii_alphabetic) && !matches!(b.get(2), Some(b'/' | b'\\'))
 }
 
+/// Where a QGIS image (a raster image marker or a picture annotation) comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageSource {
+    /// Embedded inline (`base64:…`).
+    Base64,
+    /// A local file path, resolved from the project's folder when relative.
+    File(String),
+}
+
+/// Checks a QGIS image path (`imageFile` or picture annotation `path`) against `dir` (empty when
+/// the import has no project folder). Rejects `.qgz` attachments, web addresses, network shares
+/// (`\\host\share`, `//host/share`, `/\host\share`, `\/host/share`), drive-relative paths
+/// (`C:foo.png`), and relative paths without a folder.
+pub fn local_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static str> {
+    let file = file.trim();
+    if file.starts_with("base64:") {
+        Ok(ImageSource::Base64)
+    } else if file.get(..11).is_some_and(|p| p.eq_ignore_ascii_case("attachment:")) {
+        Err("whose image is kept inside the .qgz project, which RustGIS doesn't read it from")
+    } else if file.contains("://") {
+        Err("whose image is at a web address, which RustGIS doesn't fetch")
+    } else if file.len() > 1 && file.chars().take(2).all(|c| c == '\\' || c == '/') {
+        // Looking a share up can sign in to the host the file names, which a style or
+        // project chose (as an archive on one isn't opened either).
+        Err("whose image is on a network share, which RustGIS doesn't open")
+    } else if is_drive_relative(file) {
+        Err("whose image file is relative to a drive's working folder, which no project folder tells")
+    } else if is_relative(file) && dir.is_empty() {
+        Err("whose image file is relative to a folder the import wasn't given")
+    } else {
+        Ok(ImageSource::File(absolute(file, dir)))
+    }
+}
+
 /// Whether `path` is relative to the project's folder: not absolute (`/…`, `\…`, `C:\…`), not
 /// on a drive (`C:…`, see [`is_drive_relative`]) and not a web address.
 pub fn is_relative(path: &str) -> bool {
