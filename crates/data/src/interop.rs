@@ -649,11 +649,15 @@ mod tests {
             plain_csv.lines().next().unwrap_or(""),
             "longitude,latitude,'=1+1,\"'=HYPERLINK(\"\"https://example.com\"\",\"\"x\"\")\",'+0123,big_id"
         );
-        // Both WKT CSV and plain CSV report the guarded field names and guarded text values.
+        // Both WKT CSV and plain CSV report the guarded field names (including that they read back
+        // with the apostrophe prefix) and guarded text values.
         for ext in ["wkt", "csv"] {
             let notes = crate::io::export_losses_notes(&ds, ext, None, "rt.csv").unwrap();
             assert!(
-                notes.iter().any(|n| n.contains("CSV prefixed 3 field names with an apostrophe for spreadsheet protection")),
+                notes.iter().any(|n| {
+                    n.contains("CSV prefixed 3 field names with an apostrophe for spreadsheet protection")
+                        && n.ends_with("; they read back with that prefix")
+                }),
                 "{ext}: {notes:?}"
             );
             assert!(

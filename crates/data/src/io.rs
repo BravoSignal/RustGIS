@@ -5302,8 +5302,11 @@ fn csv_guarded_headers_note(fields: &[Field], target: &str) -> Option<String> {
     }
     let target: String = target.chars().map(dbf_notice_char).collect();
     let count = guarded.len();
-    let names = if count == 1 { "field name" } else { "field names" };
-    Some(format!("{target}: CSV prefixed {count} {names} with an apostrophe for spreadsheet protection ({})", guarded.join(", ")))
+    let (names, pronoun) = if count == 1 { ("field name", "it reads") } else { ("field names", "they read") };
+    Some(format!(
+        "{target}: CSV prefixed {count} {names} with an apostrophe for spreadsheet protection ({}); {pronoun} back with that prefix",
+        guarded.join(", ")
+    ))
 }
 
 /// Notice for CSV/WKT CSV text cells prefixed with an apostrophe for spreadsheet protection.
