@@ -989,6 +989,30 @@ fn non_finite_coordinates_are_rejected() {
     line.extend(varint(0));
     line.extend(varint(0));
     assert!(decode_geometry(&line, &tiny_scale, &mut 100).is_err());
+
+    // End-to-end through `read_table`: lossy input emits a DroppedGeometry notice; clean input emits none.
+    let (mut t, x) = table(1, &[F::Oid, F::Shape { z: false, wkt: "" }], &[vec![V::Blob(pt.clone())]]);
+    let scale_bytes = 1000.0f64.to_le_bytes();
+    let pos = t.windows(8).position(|w| w == scale_bytes).expect("xy_scale in shape field header");
+    t[pos..pos + 8].copy_from_slice(&1e-308f64.to_le_bytes());
+    let (lossy_ds, lossy_report) = read_table("nonfinite", &t, &x, None).unwrap().unwrap();
+    assert_eq!(lossy_ds.features.len(), 1);
+    assert!(lossy_ds.features[0].geometry.is_none());
+    assert_eq!(lossy_report.skipped, 1);
+    assert!(
+        lossy_report.messages.iter().any(|m| {
+            m.loss == Some(crate::loss::LossCode::DroppedGeometry)
+                && m.as_str() == "1 feature had an unreadable or non-finite geometry and is kept without geometry"
+        }),
+        "{lossy_report:?}"
+    );
+
+    let (clean_t, clean_x) = table(1, &[F::Oid, F::Shape { z: false, wkt: "" }], &[vec![V::Blob(pt)]]);
+    let (clean_ds, clean_report) = read_table("clean", &clean_t, &clean_x, None).unwrap().unwrap();
+    assert_eq!(clean_ds.features.len(), 1);
+    assert!(clean_ds.features[0].geometry.is_some());
+    assert_eq!(clean_report.skipped, 0);
+    assert!(!clean_report.messages.iter().any(|m| m.loss == Some(crate::loss::LossCode::DroppedGeometry)), "{clean_report:?}");
 }
 
 #[test]

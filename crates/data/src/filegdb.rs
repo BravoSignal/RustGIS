@@ -370,6 +370,7 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     let mut no_footprint = 0usize;
     // Shapes decoded, a multipatch's too (its M values go even when it has no footprint).
     let mut decoded = 0usize;
+    let mut bad_geometries = 0usize;
     let mut unread_dates = Vec::new();
     let mut rounded_dates = Vec::new();
     let mut budget = MAX_TABLE_FACES;
@@ -413,7 +414,10 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
                     geometry = patch.footprint;
                 }
                 Ok(Decoded::Empty) => {}
-                Err(()) => report.skipped += 1,
+                Err(()) => {
+                    bad_geometries += 1;
+                    report.skipped += 1;
+                }
             }
         }
         // Kept as the file holds it, in its own system; counted when it has no place in
@@ -477,6 +481,14 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         } else {
             format!("{unmerged} multipatches whose faces couldn't be merged are drawn as the outline of their points")
         });
+    }
+    if bad_geometries > 0 {
+        let what = if bad_geometries == 1 {
+            "1 feature had an unreadable or non-finite geometry and is kept without geometry".to_string()
+        } else {
+            format!("{bad_geometries} features had unreadable or non-finite geometries and are kept without geometry")
+        };
+        report.messages.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedGeometry, what));
     }
     Ok(Some((ds, report)))
 }
