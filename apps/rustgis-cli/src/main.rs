@@ -638,8 +638,13 @@ fn scrub_json_value(value: &mut Value, key: &str, depth: usize) {
         Value::Object(map) => {
             let entries = std::mem::take(map);
             for (k, mut v) in entries {
+                let sensitive = rustgis_engine::data::address::log_sensitive(&k);
                 let k = mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(&k), key);
-                scrub_json_value(&mut v, key, depth - 1);
+                if sensitive {
+                    v = Value::String("[redacted]".into());
+                } else {
+                    scrub_json_value(&mut v, key, depth - 1);
+                }
                 map.insert(k, v);
             }
         }
@@ -1488,6 +1493,32 @@ mod tests {
             assert!(!json_entry.contains(leaked), "leaked {leaked} in JSON trace: {json_entry}");
             assert!(!plain_entry.contains(leaked), "leaked {leaked} in plain trace: {plain_entry}");
         }
+
+        // An active login whose value equals a sensitive field name must not bypass value redaction.
+        let b_field = rustgis_engine::render::rustgis_tiles::logins::activate(
+            "https://trace-field.example.test",
+            "field",
+            rustgis_engine::render::rustgis_tiles::logins::Method::Header("X-Key".into()),
+            "password",
+            false,
+        )
+        .unwrap();
+        let req_sensitive = rustgis_assistant::HttpRequest {
+            method: "POST",
+            url: "https://api.example.test/v1/chat".into(),
+            headers: Vec::new(),
+            body: Some(json!({"password": "my-db-secret", "prompt": "safe"}).to_string()),
+        };
+        let resp_sensitive: Result<_, &str> = Ok(rustgis_assistant::HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: json!({"password": "my-resp-secret", "output": "ok"}).to_string().into_bytes(),
+        });
+        let sensitive_entry = format_trace_entry(&req_sensitive, &resp_sensitive, "");
+        assert!(rustgis_engine::render::rustgis_tiles::logins::deactivate(&b_field));
+        assert!(!sensitive_entry.contains("my-db-secret"), "leaked request secret in: {sensitive_entry}");
+        assert!(!sensitive_entry.contains("my-resp-secret"), "leaked response secret in: {sensitive_entry}");
+        assert!(sensitive_entry.contains("\"prompt\":\"safe\""), "{sensitive_entry}");
     }
 
     #[cfg(unix)]
