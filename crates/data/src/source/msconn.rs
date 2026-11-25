@@ -13,13 +13,7 @@ pub fn split_password(s: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     let (mut public, password) = super::myconn::split_userinfo_password(s.trim())?;
-    let password = password.or_else(|| {
-        let (_, query) = public.split_once('?')?;
-        query.split('&').find_map(|kv| {
-            let (key, value) = kv.split_once('=')?;
-            matches!(crate::address::normalized_name(key).as_deref(), Some("pwd" | "passwd")).then(|| super::pgconn::percent_decode(value))
-        })
-    });
+    let password = password.or_else(|| super::myconn::query_password_alias(&public));
     super::credentials::redact_query(&mut public);
     Some((public, password))
 }

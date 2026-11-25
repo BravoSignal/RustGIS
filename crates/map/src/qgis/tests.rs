@@ -3377,4 +3377,23 @@ fn picture_annotations_reject_unsafe_paths() {
             report.notes
         );
     }
+
+    // A refused picture still keeps its background box and frame graphics, omitting only the picture.
+    let qgs = r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></projectCrs><projectlayers>
+      <maplayer type="annotation"><id>a</id><layername>Framed</layername><items>
+        <item type="picture" path="\\server\share\a.png" backgroundEnabled="1" frameEnabled="1" xMin="0" yMin="0" xMax="1" yMax="1">
+          <symbol type="fill" name="backgroundSymbol"><layer class="SimpleFill"><prop k="color" v="255,255,255,255"/></layer></symbol>
+          <symbol type="fill" name="frameSymbol"><layer class="SimpleFill"><prop k="outline_color" v="0,0,0,255"/></layer></symbol>
+        </item>
+      </items></maplayer></projectlayers></qgis>"#;
+    let mut report = Report::default();
+    let p = read_project(qgs, "/d", &mut report).unwrap();
+    let anns = &p.layers[0].annotations;
+    assert_eq!(anns.len(), 2, "background and frame must be kept: {anns:?}");
+    assert!(anns.iter().all(|a| a.graphic.kind == "rectangle" && a.picture.is_none()), "{anns:?}");
+    assert!(
+        report.notes.iter().any(|n| n.layer == "Framed" && n.kind == NoteKind::Skipped && n.text.contains("network share")),
+        "{:?}",
+        report.notes
+    );
 }

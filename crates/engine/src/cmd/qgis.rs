@@ -913,17 +913,19 @@ fn saved_database_connection(s: &mut Session, what: &str, connection: &str, made
 
 /// Defensively validates a picture annotation path before filesystem access, returning the
 /// resolved source to read. A path already resolved under the user-opened project folder `dir`
-/// (including when `dir` itself is a network share) is checked on its relative remainder so
-/// projects opened from a UNC folder keep loading relative pictures while other shares and unsafe
-/// paths stay refused.
+/// (including when `dir` itself is a network share) is kept as a file source without
+/// reclassifying its remainder, so filenames like `base64:logo.png` or `C:logo.png` under `dir`
+/// and projects opened from a UNC folder keep working while other shares and unsafe paths stay
+/// refused.
 fn checked_annotation_picture(picture: &str, dir: Option<&str>) -> Result<qgis::ImageSource, &'static str> {
+    let picture = picture.trim();
     let base = dir.map(|d| d.trim_end_matches(['/', '\\'])).filter(|d| !d.is_empty());
     if let Some(base) = base
         && let Some(rest) = picture.strip_prefix(base).and_then(|r| r.strip_prefix('/'))
         && !rest.is_empty()
         && !rest.starts_with(['/', '\\'])
     {
-        qgis::local_image_source(rest, base)
+        Ok(qgis::ImageSource::File(picture.to_string()))
     } else {
         qgis::local_image_source(picture, dir.unwrap_or(""))
     }
@@ -2193,6 +2195,14 @@ mod tests {
         // A different network share is still refused even when the project itself lives on a UNC folder.
         assert!(checked_annotation_picture(r"\\other\share\pic.png", Some(unc_dir)).is_err());
         assert!(checked_annotation_picture(r"\\server\share\proj//other/pic.png", Some(unc_dir)).is_err());
+        assert!(checked_annotation_picture(r"\\server\share\proj/\other/pic.png", Some(unc_dir)).is_err());
+
+        // Resolved filenames under the project folder stay File sources even if the basename looks like a prefix.
+        assert_eq!(
+            checked_annotation_picture("/tmp/base64:logo.png", Some("/tmp")),
+            Ok(qgis::ImageSource::File("/tmp/base64:logo.png".into()))
+        );
+        assert_eq!(checked_annotation_picture("/tmp/C:logo.png", Some("/tmp")), Ok(qgis::ImageSource::File("/tmp/C:logo.png".into())));
 
         // Round-trip through add_annotations: not rejected as a network share.
         let mut s = Session::new(crate::Project::default());

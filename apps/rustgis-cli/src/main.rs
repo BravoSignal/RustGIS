@@ -602,10 +602,78 @@ fn ask(s: &mut Session, args: &[String], saved: Option<&Saved>, env: &Environmen
     Ok(())
 }
 
-/// Scrubs active service login values and the assistant's own API key from trace text.
+/// Scrubs active service login values and the assistant's own API key (raw and JSON-escaped)
+/// from trace text.
 fn mask_trace_secrets(text: &str, key: &str) -> String {
-    let scrubbed = rustgis_engine::render::rustgis_tiles::logins::scrub(text);
-    if key.is_empty() { scrubbed } else { scrubbed.replace(key, "[redacted]") }
+    let mut scrubbed = rustgis_engine::render::rustgis_tiles::logins::scrub(text);
+    if !key.is_empty() {
+        scrubbed = scrubbed.replace(key, "[redacted]");
+        if let Ok(quoted) = serde_json::to_string(key)
+            && let Some(escaped) = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+            && escaped != key
+        {
+            scrubbed = scrubbed.replace(escaped, "[redacted]");
+        }
+    }
+    scrubbed
+}
+
+/// Recursively redacts decoded JSON string values and object keys (bounded to `depth`) so
+/// JSON-escaped active credentials and API keys (for example containing `\` or `"`) match before
+/// re-serialization.
+fn scrub_json_value(value: &mut Value, key: &str, depth: usize) {
+    if depth == 0 {
+        *value = Value::String("[redacted]".into());
+        return;
+    }
+    match value {
+        Value::String(s) => {
+            *s = mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(s), key);
+        }
+        Value::Array(items) => {
+            for item in items {
+                scrub_json_value(item, key, depth - 1);
+            }
+        }
+        Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (k, mut v) in entries {
+                let k = mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(&k), key);
+                scrub_json_value(&mut v, key, depth - 1);
+                map.insert(k, v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scrubs a request or response body for `--trace`: decodes JSON payloads (whole bodies and SSE
+/// `data:` lines) so escaped credentials match active logins and the API key, while keeping raw
+/// redaction for non-JSON text.
+fn scrub_trace_body(body: &str, key: &str) -> String {
+    const MAX_JSON_DEPTH: usize = 64;
+    let decoded = if let Ok(mut value) = serde_json::from_str::<Value>(body) {
+        scrub_json_value(&mut value, key, MAX_JSON_DEPTH);
+        serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
+    } else if body.lines().any(|line| line.starts_with("data:")) {
+        body.lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("data:")
+                    && let Ok(mut value) = serde_json::from_str::<Value>(rest.trim())
+                {
+                    scrub_json_value(&mut value, key, MAX_JSON_DEPTH);
+                    if let Ok(serialized) = serde_json::to_string(&value) {
+                        return format!("data: {serialized}");
+                    }
+                }
+                line.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        body.to_string()
+    };
+    mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(&decoded), key)
 }
 
 /// Formats a `--trace` entry for an assistant request and its response, redacting URL
@@ -616,13 +684,9 @@ fn format_trace_entry<E: std::fmt::Display>(
     key: &str,
 ) -> String {
     let url = mask_trace_secrets(&rustgis_engine::sources::redact(&req.url), key);
-    let body = mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(req.body.as_deref().unwrap_or("")), key);
+    let body = scrub_trace_body(req.body.as_deref().unwrap_or(""), key);
     let answer = match resp {
-        Ok(r) => format!(
-            "HTTP {}\n{}",
-            r.status,
-            mask_trace_secrets(&rustgis_engine::data::diagnostics::redact_parameter(&String::from_utf8_lossy(&r.body)), key)
-        ),
+        Ok(r) => format!("HTTP {}\n{}", r.status, scrub_trace_body(&String::from_utf8_lossy(&r.body), key)),
         Err(e) => mask_trace_secrets(&rustgis_engine::data::diagnostics::redact(&e.to_string()), key),
     };
     format!("> {} {url}\n{body}\n< {answer}\n\n", req.method)
@@ -1376,6 +1440,53 @@ mod tests {
         assert!(entry.contains("HTTP 400") && entry.contains("\"prompt\""), "{entry}");
         for secret in ["urlpw", "sk-test-key-12345", "errpw", "errkey", "active-login-secret-999"] {
             assert!(!err_entry.contains(secret), "leaked {secret} in: {err_entry}");
+        }
+
+        // JSON-escaped credentials containing backslashes and double quotes are redacted in JSON bodies.
+        let slash_secret = r"login\slash-secret-42";
+        let quote_secret = r#"login"quote-secret-42"#;
+        let escaped_key = r#"sk\key"escape-42"#;
+        let b_slash = rustgis_engine::render::rustgis_tiles::logins::activate(
+            "https://trace-slash.example.test",
+            "slash",
+            rustgis_engine::render::rustgis_tiles::logins::Method::Header("X-Key".into()),
+            slash_secret,
+            false,
+        )
+        .unwrap();
+        let b_quote = rustgis_engine::render::rustgis_tiles::logins::activate(
+            "https://trace-quote.example.test",
+            "quote",
+            rustgis_engine::render::rustgis_tiles::logins::Method::Header("X-Key".into()),
+            quote_secret,
+            false,
+        )
+        .unwrap();
+        let req_json = rustgis_assistant::HttpRequest {
+            method: "POST",
+            url: "https://api.example.test/v1/chat".into(),
+            headers: Vec::new(),
+            body: Some(json!({"prompt": format!("req {slash_secret} {quote_secret} {escaped_key}")}).to_string()),
+        };
+        let resp_json: Result<_, &str> = Ok(rustgis_assistant::HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: json!({"output": format!("resp {slash_secret} {quote_secret} {escaped_key}")}).to_string().into_bytes(),
+        });
+        let json_entry = format_trace_entry(&req_json, &resp_json, escaped_key);
+        let plain_resp: Result<_, &str> = Ok(rustgis_assistant::HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: format!("plain {slash_secret} {quote_secret} {escaped_key}").into_bytes(),
+        });
+        let plain_entry = format_trace_entry(&req_json, &plain_resp, escaped_key);
+        assert!(rustgis_engine::render::rustgis_tiles::logins::deactivate(&b_slash));
+        assert!(rustgis_engine::render::rustgis_tiles::logins::deactivate(&b_quote));
+        for leaked in
+            [slash_secret, r"login\\slash-secret-42", quote_secret, r#"login\"quote-secret-42"#, escaped_key, r#"sk\\key\"escape-42"#]
+        {
+            assert!(!json_entry.contains(leaked), "leaked {leaked} in JSON trace: {json_entry}");
+            assert!(!plain_entry.contains(leaked), "leaked {leaked} in plain trace: {plain_entry}");
         }
     }
 
