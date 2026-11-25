@@ -1081,11 +1081,9 @@ fn is_under_project_dir(file: &str, dir: &str) -> bool {
     depth > 0
 }
 
-/// Checks a QGIS image path (`imageFile` or picture annotation `path`) against `dir` (empty when
-/// the import has no project folder). Rejects `.qgz` attachments, web addresses, network shares
-/// (`\\host\share`, `//host/share`, `/\host\share`, `\/host/share`) outside the user-opened
-/// project folder `dir`, drive-relative paths (`C:foo.png`), and relative paths without a folder.
-pub fn local_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static str> {
+/// Shared validation for [`local_image_source`] (`resolve = true`, for raw XML paths) and
+/// [`check_resolved_image_source`] (`resolve = false`, for paths already resolved against `dir`).
+fn check_image_source(file: &str, dir: &str, resolve: bool) -> Result<ImageSource, &'static str> {
     let file = file.trim();
     if file.starts_with("base64:") {
         Ok(ImageSource::Base64)
@@ -1093,7 +1091,7 @@ pub fn local_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static
         Err("whose image is kept inside the .qgz project, which RustGIS doesn't read it from")
     } else if file.contains("://") {
         Err("whose image is at a web address, which RustGIS doesn't fetch")
-    } else if is_under_project_dir(file, dir) {
+    } else if !is_relative(file) && is_under_project_dir(file, dir) {
         Ok(ImageSource::File(file.to_string()))
     } else if file.len() > 1 && file.chars().take(2).all(|c| c == '\\' || c == '/') {
         // Looking a share up can sign in to the host the file names, which a style or
@@ -1103,9 +1101,25 @@ pub fn local_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static
         Err("whose image file is relative to a drive's working folder, which no project folder tells")
     } else if is_relative(file) && dir.is_empty() {
         Err("whose image file is relative to a folder the import wasn't given")
-    } else {
+    } else if resolve {
         Ok(ImageSource::File(absolute(file, dir)))
+    } else {
+        Ok(ImageSource::File(file.to_string()))
     }
+}
+
+/// Checks a QGIS image path (`imageFile` or picture annotation `path`) against `dir` (empty when
+/// the import has no project folder). Rejects `.qgz` attachments, web addresses, network shares
+/// (`\\host\share`, `//host/share`, `/\host\share`, `\/host/share`) outside the user-opened
+/// project folder `dir`, drive-relative paths (`C:foo.png`), and relative paths without a folder.
+pub fn local_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static str> {
+    check_image_source(file, dir, true)
+}
+
+/// Validates a picture path already resolved against `dir` without joining `dir` a second time.
+/// Applies the same safety checks as [`local_image_source`].
+pub fn check_resolved_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static str> {
+    check_image_source(file, dir, false)
 }
 
 /// Whether `path` is relative to the project's folder: not absolute (`/…`, `\…`, `C:\…`), not

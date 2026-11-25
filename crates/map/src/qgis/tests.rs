@@ -3437,4 +3437,9 @@ fn picture_annotations_reject_unsafe_paths() {
             report.notes
         );
     }
+
+    // A relative picture path whose first segment happens to match a relative project folder is
+    // still resolved relative to `dir` rather than treated as already resolved.
+    assert_eq!(local_image_source("maps/logo.png", "maps"), Ok(ImageSource::File("maps/maps/logo.png".into())));
+    assert_eq!(check_resolved_image_source("data/../pic.png", "data"), Ok(ImageSource::File("data/../pic.png".into())));
 }

@@ -911,12 +911,13 @@ fn saved_database_connection(s: &mut Session, what: &str, connection: &str, made
     }
 }
 
-/// Defensively validates a picture annotation path before filesystem access, returning the
-/// resolved source to read. Delegates to [`qgis::local_image_source`], which keeps paths already
-/// resolved inside the user-opened project folder `dir` (including UNC project folders) as file
-/// sources while refusing other shares and unsafe paths.
+/// Defensively validates a picture annotation path already resolved against `dir` before
+/// filesystem access, without re-prefixing `dir`. Delegates to
+/// [`qgis::check_resolved_image_source`], which keeps paths inside the user-opened project folder
+/// `dir` (including UNC project folders) as file sources while refusing other shares and unsafe
+/// paths.
 fn checked_annotation_picture(picture: &str, dir: Option<&str>) -> Result<qgis::ImageSource, &'static str> {
-    qgis::local_image_source(picture, dir.unwrap_or(""))
+    qgis::check_resolved_image_source(picture, dir.unwrap_or(""))
 }
 
 /// Adds a QGIS annotation layer as a graphics layer: its annotations taken from its coordinate
@@ -2192,48 +2193,30 @@ mod tests {
         );
         assert_eq!(checked_annotation_picture("/tmp/C:logo.png", Some("/tmp")), Ok(qgis::ImageSource::File("/tmp/C:logo.png".into())));
 
+        // Already-resolved relative project paths are not double-prefixed with `dir`.
+        assert_eq!(checked_annotation_picture("data/../pic.png", Some("data")), Ok(qgis::ImageSource::File("data/../pic.png".into())));
+        assert!(checked_annotation_picture("pic.png", None).is_err());
+
         // Round-trip through add_annotations: not rejected as a network share.
         let mut s = Session::new(crate::Project::default());
         let mut pictures = Pictures::default();
         add_annotations(&mut s, &project.layers[0], Some("EPSG:4326"), None, Some(unc_dir), &mut pictures, &mut report).unwrap();
         assert!(!report.notes.iter().any(|n| n.text.contains("network share")), "{:?}", report.notes);
 
-        // Unresolved relative picture uses the real project folder and reads the validated path.
+        // Round-trip read_project -> add_annotations with a real file under `dir`.
         let dir = std::env::temp_dir().join(format!("rustgis-qgis-ann-rel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let png = tiny_skia::Pixmap::new(2, 2).unwrap().encode_png().unwrap();
         std::fs::write(dir.join("pic.png"), &png).unwrap();
-        let rect = rustgis_data::Geometry::Polygon(vec![vec![vec![
-            rustgis_geom::Coord::new(0.0, 0.0),
-            rustgis_geom::Coord::new(1.0, 0.0),
-            rustgis_geom::Coord::new(1.0, 1.0),
-            rustgis_geom::Coord::new(0.0, 1.0),
-            rustgis_geom::Coord::new(0.0, 0.0),
-        ]]]);
-        let rel_layer = qgis::ProjectLayer {
-            id: "r".into(),
-            name: "RelPic".into(),
-            provider: String::new(),
-            kind: "annotation".into(),
-            vector: false,
-            visible: true,
-            checked: true,
-            group: None,
-            definition_query: None,
-            crs: Some("EPSG:4326".into()),
-            source: qgis::Source::Other { provider: String::new() },
-            style: qgis::Style::default(),
-            annotations: vec![qgis::Annotation {
-                graphic: rustgis_map::graphics::Graphic::new("picture", rect),
-                picture: Some("pic.png".into()),
-                keep_aspect: false,
-            }],
-        };
+        let dir_str = dir.to_string_lossy();
         let mut rel_report = Report::default();
+        let rel_project = qgis::read_project(qgs, &dir_str, &mut |_| Err("unused"), &mut rel_report).unwrap();
+        let mut s_rel = Session::new(crate::Project::default());
         let mut rel_pics = Pictures::default();
-        add_annotations(&mut s, &rel_layer, Some("EPSG:4326"), None, Some(&dir.to_string_lossy()), &mut rel_pics, &mut rel_report).unwrap();
-        let added = s.map().layer_by_name("RelPic").unwrap();
+        add_annotations(&mut s_rel, &rel_project.layers[0], Some("EPSG:4326"), None, Some(&dir_str), &mut rel_pics, &mut rel_report)
+            .unwrap();
+        let added = s_rel.map().layer_by_name("UncPics").unwrap();
         assert_eq!(added.dataset.features.len(), 1, "{:?}", rel_report.notes);
         let _ = std::fs::remove_dir_all(&dir);
     }
