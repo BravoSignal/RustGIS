@@ -912,23 +912,11 @@ fn saved_database_connection(s: &mut Session, what: &str, connection: &str, made
 }
 
 /// Defensively validates a picture annotation path before filesystem access, returning the
-/// resolved source to read. A path already resolved under the user-opened project folder `dir`
-/// (including when `dir` itself is a network share) is kept as a file source without
-/// reclassifying its remainder, so filenames like `base64:logo.png` or `C:logo.png` under `dir`
-/// and projects opened from a UNC folder keep working while other shares and unsafe paths stay
-/// refused.
+/// resolved source to read. Delegates to [`qgis::local_image_source`], which keeps paths already
+/// resolved inside the user-opened project folder `dir` (including UNC project folders) as file
+/// sources while refusing other shares and unsafe paths.
 fn checked_annotation_picture(picture: &str, dir: Option<&str>) -> Result<qgis::ImageSource, &'static str> {
-    let picture = picture.trim();
-    let base = dir.map(|d| d.trim_end_matches(['/', '\\'])).filter(|d| !d.is_empty());
-    if let Some(base) = base
-        && let Some(rest) = picture.strip_prefix(base).and_then(|r| r.strip_prefix('/'))
-        && !rest.is_empty()
-        && !rest.starts_with(['/', '\\'])
-    {
-        Ok(qgis::ImageSource::File(picture.to_string()))
-    } else {
-        qgis::local_image_source(picture, dir.unwrap_or(""))
-    }
+    qgis::local_image_source(picture, dir.unwrap_or(""))
 }
 
 /// Adds a QGIS annotation layer as a graphics layer: its annotations taken from its coordinate

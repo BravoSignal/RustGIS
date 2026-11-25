@@ -3396,4 +3396,45 @@ fn picture_annotations_reject_unsafe_paths() {
         "{:?}",
         report.notes
     );
+
+    // An absolute UNC picture path inside the user-opened UNC project folder is accepted, while
+    // another share, sibling folder, or `..` traversal escaping `dir` stays refused.
+    let unc_dir = r"\\nas\gis\proj";
+    for allowed in [r"\\nas\gis\proj\pic.png", r"\\nas\gis\proj\sub\pic.png", r"\\nas\gis\proj\sub\..\pic.png", "//nas/gis/proj/pic.png"] {
+        let qgs = format!(
+            r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></projectCrs><projectlayers>
+            <maplayer type="annotation"><id>a</id><layername>UncOk</layername><items>
+              <item type="picture" path="{allowed}" xMin="0" yMin="0" xMax="1" yMax="1"/>
+            </items></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        let p = read_project(&qgs, unc_dir, &mut report).unwrap();
+        assert_eq!(p.layers[0].annotations.len(), 1, "{allowed}: {:?}", report.notes);
+        assert_eq!(p.layers[0].annotations[0].picture.as_deref(), Some(allowed));
+        assert!(!report.notes.iter().any(|n| n.text.contains("network share")), "{allowed}: {:?}", report.notes);
+    }
+    for denied in [
+        r"\\other\share\pic.png",
+        r"\\nas\other\pic.png",
+        r"\\nas\gis\proj2\pic.png",
+        r"\\nas\gis\proj\..\other\pic.png",
+        r"\\nas\gis\proj\sub\..\..\other\pic.png",
+        r"\\nas\gis\proj//other/pic.png",
+        r"\\nas\gis\proj/\other/pic.png",
+    ] {
+        let qgs = format!(
+            r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:4326</authid></spatialrefsys></projectCrs><projectlayers>
+            <maplayer type="annotation"><id>a</id><layername>UncNo</layername><items>
+              <item type="picture" path="{denied}" xMin="0" yMin="0" xMax="1" yMax="1"/>
+            </items></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        let p = read_project(&qgs, unc_dir, &mut report).unwrap();
+        assert!(p.layers[0].annotations.is_empty(), "{denied} produced {:?}", p.layers[0].annotations);
+        assert!(
+            report.notes.iter().any(|n| n.layer == "UncNo" && n.kind == NoteKind::Skipped && n.text.contains("network share")),
+            "{denied}: {:?}",
+            report.notes
+        );
+    }
 }

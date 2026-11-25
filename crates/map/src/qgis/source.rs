@@ -1028,10 +1028,63 @@ pub enum ImageSource {
     File(String),
 }
 
+/// Strips the user-opened project folder `dir` and its following separator from `file`, returning
+/// the remainder. For UNC project folders, `/` and `\` are treated as equivalent in the prefix so
+/// Qt's forward-slash UNC spelling matches a Windows backslash folder.
+fn strip_project_dir<'a>(file: &'a str, dir: &str) -> Option<&'a str> {
+    let base = dir.trim_end_matches(['/', '\\']);
+    if base.is_empty() {
+        return None;
+    }
+    if let Some(rest) = file.strip_prefix(base).and_then(|r| r.strip_prefix(['/', '\\'])) {
+        return Some(rest);
+    }
+    if base.len() > 1 && base.chars().take(2).all(|c| c == '\\' || c == '/') {
+        let mut f = file.char_indices();
+        for bc in base.chars() {
+            let (_, fc) = f.next()?;
+            let both_sep = matches!(bc, '/' | '\\') && matches!(fc, '/' | '\\');
+            if fc != bc && !both_sep {
+                return None;
+            }
+        }
+        let (_, sep) = f.next()?;
+        if matches!(sep, '/' | '\\') {
+            return f.next().and_then(|(i, _)| file.get(i..));
+        }
+    }
+    None
+}
+
+/// Whether `file` already names a file inside `dir` (not empty, not starting with a separator,
+/// and never climbing above `dir` through `..` segments).
+fn is_under_project_dir(file: &str, dir: &str) -> bool {
+    let Some(rest) = strip_project_dir(file, dir) else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with(['/', '\\']) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for seg in rest.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            _ => depth += 1,
+        }
+    }
+    depth > 0
+}
+
 /// Checks a QGIS image path (`imageFile` or picture annotation `path`) against `dir` (empty when
 /// the import has no project folder). Rejects `.qgz` attachments, web addresses, network shares
-/// (`\\host\share`, `//host/share`, `/\host\share`, `\/host/share`), drive-relative paths
-/// (`C:foo.png`), and relative paths without a folder.
+/// (`\\host\share`, `//host/share`, `/\host\share`, `\/host/share`) outside the user-opened
+/// project folder `dir`, drive-relative paths (`C:foo.png`), and relative paths without a folder.
 pub fn local_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static str> {
     let file = file.trim();
     if file.starts_with("base64:") {
@@ -1040,6 +1093,8 @@ pub fn local_image_source(file: &str, dir: &str) -> Result<ImageSource, &'static
         Err("whose image is kept inside the .qgz project, which RustGIS doesn't read it from")
     } else if file.contains("://") {
         Err("whose image is at a web address, which RustGIS doesn't fetch")
+    } else if is_under_project_dir(file, dir) {
+        Ok(ImageSource::File(file.to_string()))
     } else if file.len() > 1 && file.chars().take(2).all(|c| c == '\\' || c == '/') {
         // Looking a share up can sign in to the host the file names, which a style or
         // project chose (as an archive on one isn't opened either).
