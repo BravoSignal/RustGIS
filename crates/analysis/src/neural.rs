@@ -89,13 +89,22 @@ impl Mlp {
 
     /// Class probabilities for one pixel's band values.
     pub fn probabilities(&self, x: &[f32]) -> Vec<f32> {
+        let out_len = self.layers.last().map_or(0, |l| l.out);
         let mut a: Vec<f32> = x.iter().zip(self.mean.iter().zip(&self.std)).map(|(v, (m, s))| (v - m) / s).collect();
+        if !a.iter().all(|v| v.is_finite()) {
+            return vec![f32::NAN; out_len];
+        }
         let last = self.layers.len().saturating_sub(1);
         for (k, l) in self.layers.iter().enumerate() {
             let mut z = l.b.clone();
             for (o, zo) in z.iter_mut().enumerate() {
                 let row = l.w.get(o * l.inp..(o + 1) * l.inp).unwrap_or(&[]);
                 *zo += row.iter().zip(&a).map(|(w, v)| w * v).sum::<f32>();
+            }
+            // Reject non-finite activations before ReLU: `f32::NAN.max(0.0)` returns `0.0`, which
+            // would silently mask a hidden-layer overflow into finite probabilities.
+            if !z.iter().all(|v| v.is_finite()) {
+                return vec![f32::NAN; out_len];
             }
             if k < last {
                 z.iter_mut().for_each(|v| *v = v.max(0.0));
@@ -760,5 +769,28 @@ mod tests {
 
         let clean = Raster::new("clean", 2, 1, vec![vec![1.0, -1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
         assert_eq!(classify_reporting(&clean, &model, -1.0).unwrap().overflowed, 0);
+
+        // A hidden-layer NaN (+inf + -inf) must not be turned into 0.0 by ReLU.
+        let hidden_model = Mlp {
+            bands: vec![0, 1],
+            mean: vec![0.0, 0.0],
+            std: vec![1.0, 1.0],
+            layers: vec![
+                Dense { inp: 2, out: 1, w: vec![10.0, -5.0], b: vec![0.0] },
+                Dense { inp: 1, out: 2, w: vec![1.0, -1.0], b: vec![-1.0, 1.0] },
+            ],
+            classes: vec!["a".into(), "b".into()],
+        };
+        hidden_model.validate().unwrap();
+        assert_eq!(hidden_model.predict_checked(&[1.0e38, 1.0e38]), None);
+        assert!(hidden_model.predict_checked(&[1.0, 1.0]).is_some_and(|(c, p)| c == 0 && p > 0.9));
+        let r_hidden =
+            Raster::new("hidden_img", 2, 1, vec![vec![1.0, 1.0e38], vec![1.0, 1.0e38]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32")
+                .unwrap();
+        let res_hidden = classify_reporting(&r_hidden, &hidden_model, -1.0).unwrap();
+        assert_eq!(res_hidden.overflowed, 1);
+        assert_eq!(res_hidden.class[0], 1.0);
+        assert_eq!(res_hidden.class[1], -1.0);
+        assert_eq!(res_hidden.prob[1], -1.0);
     }
 }

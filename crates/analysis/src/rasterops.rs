@@ -423,6 +423,7 @@ fn dist_m(a: Coord, b: Coord) -> f64 {
 pub fn elevation_at(r: &Raster, b: usize, ll: Coord) -> Option<f64> {
     let w = r.transformer().from_lonlat(ll)?;
     let (x, y) = r.transform.to_pixel(w);
+    let x = r.wrap_col(x);
     let (x, y) = (x - 0.5, y - 0.5);
     let (c0, r0) = (x.floor() as i64, y.floor() as i64);
     let (fx, fy) = (x - c0 as f64, y - r0 as f64);
@@ -3308,6 +3309,17 @@ mod tests {
         for &(d, c, _) in &prof_west {
             assert!(d.is_finite() && c.is_finite());
             assert!(c.x.abs() >= 178.999 && c.x.abs() <= 180.0, "westbound sample swept away: {c:?}");
+        }
+
+        // Regional raster spanning 179..183 deg: wrapped samples past 180 (e.g. -179.5) must still
+        // resolve onto the raster's columns via its longitude wrap.
+        let reg_gt = GeoTransform { origin_x: 179.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let reg = Raster::new("regional", 4, 4, vec![vec![250.0; 16]], reg_gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let prof_reg = profile(&reg, 0, &[Coord::new(179.5, 0.0), Coord::new(-177.5, 0.0)], 13);
+        assert_eq!(prof_reg.len(), 13);
+        for &(d, c, z) in &prof_reg {
+            assert!(d.is_finite() && c.is_finite());
+            assert_eq!(z, Some(250.0), "regional antimeridian raster missed elevation at {c:?}");
         }
     }
 }

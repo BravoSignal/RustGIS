@@ -96,6 +96,16 @@ fn blocks_bridge(pm: (f64, f64), v: (f64, f64), a: (f64, f64), b: (f64, f64)) ->
     false
 }
 
+/// Nearest vertices before and after `pos` in `ring` whose coordinates differ from `pts[ring[pos]]`,
+/// wrapping around the ring. Returns `None` when every vertex in `ring` coincides with `pos`.
+fn distinct_neighbors(pts: &[(f64, f64)], ring: &[usize], pos: usize) -> Option<((f64, f64), (f64, f64))> {
+    let n = ring.len();
+    let cur = pts[ring[pos]];
+    let prev = (1..n).map(|step| pts[ring[(pos + n - step) % n]]).find(|&p| p != cur)?;
+    let next = (1..n).map(|step| pts[ring[(pos + step) % n]]).find(|&p| p != cur)?;
+    Some((prev, next))
+}
+
 /// Triangles (indices into `outer` followed by each hole's vertices, in order) covering the polygon.
 /// Rings are open (no repeated closing vertex). `None` when the polygon is degenerate or too large.
 pub fn triangulate(outer: &[(f64, f64)], holes: &[Vec<(f64, f64)>]) -> Option<Vec<[usize; 3]>> {
@@ -139,9 +149,7 @@ pub fn triangulate_reporting(outer: &[(f64, f64)], holes: &[Vec<(f64, f64)>]) ->
     for (hi, h) in hole_rings.iter().enumerate() {
         let (mpos, &m) = h.iter().enumerate().max_by(|a, b| pts[*a.1].0.total_cmp(&pts[*b.1].0))?;
         let pm = pts[m];
-        let hn = h.len();
-        let h_prev = pts[h[(mpos + hn - 1) % hn]];
-        let h_next = pts[h[(mpos + 1) % hn]];
+        let (h_prev, h_next) = distinct_neighbors(&pts, h, mpos)?;
         let edges_clear = |v: (f64, f64), work: &mut usize| {
             let ring_ok = (0..ring.len()).all(|k| {
                 *work += 1;
@@ -156,15 +164,15 @@ pub fn triangulate_reporting(outer: &[(f64, f64)], holes: &[Vec<(f64, f64)>]) ->
                 });
             ring_ok && holes_ok
         };
-        let rn = ring.len();
         let mut best: Option<(usize, f64)> = None;
         for (k, &vi) in ring.iter().enumerate() {
             let v = pts[vi];
             if !in_interior_wedge(h_prev, pm, h_next, v) {
                 continue;
             }
-            let r_prev = pts[ring[(k + rn - 1) % rn]];
-            let r_next = pts[ring[(k + 1) % rn]];
+            let Some((r_prev, r_next)) = distinct_neighbors(&pts, &ring, k) else {
+                continue;
+            };
             if !in_interior_wedge(r_prev, v, r_next, pm) {
                 continue;
             }
@@ -349,5 +357,14 @@ mod tests {
         for pt in [(2.0, 5.0), (6.0, 5.0)] {
             assert!(!tris2.iter().any(|t| in_triangle(pt, all2[t[0]], all2[t[1]], all2[t[2]])));
         }
+
+        // Repeated consecutive coordinates at the hole's rightmost vertex must not produce a
+        // zero-length wedge edge and fail bridging.
+        let dup_hole = vec![(6.0, 4.0), (8.0, 5.0), (8.0, 5.0), (6.0, 6.0)];
+        let all3: Vec<(f64, f64)> = sq.iter().chain(&dup_hole).copied().collect();
+        let (tris3, fanned3) = triangulate_reporting(&sq, std::slice::from_ref(&dup_hole)).unwrap();
+        assert!(!fanned3, "hole with repeated rightmost vertex should bridge cleanly");
+        assert!((area(&all3, &tris3) - 98.0).abs() < 1e-9, "expected area 98, got {}", area(&all3, &tris3));
+        assert!(!tris3.iter().any(|t| in_triangle((6.5, 5.0), all3[t[0]], all3[t[1]], all3[t[2]])));
     }
 }
