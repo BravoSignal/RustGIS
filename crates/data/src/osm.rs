@@ -305,6 +305,11 @@ struct Osm {
     /// Cumulative bytes of decoded tag and role strings retained across the file.
     text_bytes: usize,
     text_limit: usize,
+    /// Entities and decoded tag/role text bytes omitted after reaching `text_limit`.
+    text_capped_nodes: u64,
+    text_capped_ways: u64,
+    text_capped_relations: u64,
+    text_capped_bytes: u64,
 }
 
 impl Osm {
@@ -319,14 +324,17 @@ impl Osm {
             omitted_members: 0,
             text_bytes: 0,
             text_limit,
+            text_capped_nodes: 0,
+            text_capped_ways: 0,
+            text_capped_relations: 0,
+            text_capped_bytes: 0,
         }
     }
 
-    /// Reserves `bytes` from the retained tag/role text budget, or marks the extract capped.
+    /// Reserves `bytes` from the retained tag/role text budget.
     fn try_charge_text(&mut self, bytes: usize) -> bool {
         let next = self.text_bytes.saturating_add(bytes);
         if next > self.text_limit {
-            self.capped = true;
             return false;
         }
         self.text_bytes = next;
@@ -400,8 +408,12 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                     let (has_tags, cost) = tags_info(&strings, &k, &vv);
                     let t = if !has_tags {
                         Vec::new()
-                    } else if osm.points.len() >= MAX_NODES || !osm.try_charge_text(cost) {
+                    } else if osm.points.len() >= MAX_NODES {
                         osm.capped = true;
+                        Vec::new()
+                    } else if !osm.try_charge_text(cost) {
+                        osm.text_capped_nodes = osm.text_capped_nodes.saturating_add(1);
+                        osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                         Vec::new()
                     } else {
                         tags(&strings, &k, &vv)
@@ -444,8 +456,12 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                         }
                         let t = if !has_tags {
                             Vec::new()
-                        } else if osm.points.len() >= MAX_NODES || !osm.try_charge_text(cost) {
+                        } else if osm.points.len() >= MAX_NODES {
                             osm.capped = true;
+                            Vec::new()
+                        } else if !osm.try_charge_text(cost) {
+                            osm.text_capped_nodes = osm.text_capped_nodes.saturating_add(1);
+                            osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                             Vec::new()
                         } else {
                             let mut t = Vec::new();
@@ -492,6 +508,8 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                     }
                     let (has_tags, cost) = tags_info(&strings, &k, &vv);
                     if has_tags && !osm.try_charge_text(cost) {
+                        osm.text_capped_ways = osm.text_capped_ways.saturating_add(1);
+                        osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                         continue;
                     }
                     let places = (!lats.is_empty() && lats.len() == refs.len() && lons.len() == refs.len()).then(|| {
@@ -557,7 +575,10 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                             .take(MAX_MEMBERS)
                             .map(|r| usize::try_from(*r).ok().and_then(|i| strings.get(i)).map_or(0, String::len))
                             .fold(0usize, usize::saturating_add);
-                        if !osm.try_charge_text(tag_bytes.saturating_add(role_bytes)) {
+                        let cost = tag_bytes.saturating_add(role_bytes);
+                        if !osm.try_charge_text(cost) {
+                            osm.text_capped_relations = osm.text_capped_relations.saturating_add(1);
+                            osm.text_capped_bytes = osm.text_capped_bytes.saturating_add(cost as u64);
                             continue;
                         }
                         // Node members are never read, so only the others past the limit are
@@ -583,11 +604,7 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Reads the file's blocks.
-fn blocks(bytes: &[u8]) -> Result<Osm> {
-    blocks_with_text_limit(bytes, MAX_TEXT_BYTES)
-}
-
+/// Reads the file's blocks within a `text_limit`-byte retained tag/role budget.
 fn blocks_with_text_limit(bytes: &[u8], text_limit: usize) -> Result<Osm> {
     let mut osm = Osm::with_text_limit(text_limit);
     let mut i = 0usize;
@@ -728,9 +745,13 @@ fn inside(p: Coord, ring: &[Coord]) -> bool {
 /// between blocks and between the ways and relations built from them; decoding one block is one
 /// step without a look.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>> {
+    read_with_text_limit(file_name, bytes, MAX_TEXT_BYTES)
+}
+
+fn read_with_text_limit(file_name: &str, bytes: &[u8], text_limit: usize) -> Result<Vec<(Dataset, ReadReport)>> {
     let stem = std::path::Path::new(file_name).file_name().and_then(|s| s.to_str()).unwrap_or("osm");
     let stem = stem.trim_end_matches(".pbf").trim_end_matches(".osm").to_string();
-    let mut osm = blocks(bytes)?;
+    let mut osm = blocks_with_text_limit(bytes, text_limit)?;
     osm.nodes.sort_unstable_by_key(|n| n.0);
     let node = |id: i64| -> Option<Coord> {
         let i = osm.nodes.binary_search_by_key(&id, |n| n.0).ok()?;
@@ -909,6 +930,30 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             .messages
             .push(crate::loss::Note::loss(crate::loss::LossCode::DroppedOverLimit, "the extract is larger than RustGIS reads at once: the rest is left out (use a smaller extract; on the desktop, files over 256 MB open through GDAL when it is installed)"));
     }
+    let text_capped_note = (osm.text_capped_nodes > 0 || osm.text_capped_ways > 0 || osm.text_capped_relations > 0).then(|| {
+        let mut parts = Vec::new();
+        if osm.text_capped_nodes > 0 {
+            let n = osm.text_capped_nodes;
+            parts.push(format!("{n} {} (tags dropped in points)", if n == 1 { "tagged node" } else { "tagged nodes" }));
+        }
+        if osm.text_capped_ways > 0 {
+            let n = osm.text_capped_ways;
+            parts.push(format!("{n} {} (omitted from lines/multipolygons)", if n == 1 { "tagged way" } else { "tagged ways" }));
+        }
+        if osm.text_capped_relations > 0 {
+            let n = osm.text_capped_relations;
+            parts.push(format!("{n} {} (omitted from multipolygons)", if n == 1 { "relation" } else { "relations" }));
+        }
+        format!(
+            "OSM tag/role text reached the {}-byte limit: {} ({} bytes of text left out)",
+            osm.text_limit,
+            parts.join(", "),
+            osm.text_capped_bytes,
+        )
+    });
+    if let Some(note) = &text_capped_note {
+        report.messages.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedOverLimit, note.clone()));
+    }
     if missing > 0 {
         report.messages.push(crate::loss::Note::loss(
             crate::loss::LossCode::DroppedFeature,
@@ -961,6 +1006,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         *first = report;
     }
     if out.is_empty() {
+        if let Some(note) = text_capped_note {
+            return Err(DataError::Format(format!("{file_name}: {note}")));
+        }
         return Err(DataError::Format(format!("{file_name}: nothing tagged to draw")));
     }
     Ok(out)
@@ -1599,12 +1647,13 @@ pub(crate) mod tests {
 
         let big = "x".repeat(512);
         let mut st = Vec::new();
-        for s in ["", "name", big.as_str(), "type", "multipolygon", "route"] {
+        for s in ["", "name", big.as_str(), "type", "multipolygon", "route", "highway", "road"] {
             field_bytes(1, s.as_bytes(), &mut st);
         }
-        // Ten dense nodes all referencing the same 512-byte string entry (> 5 KiB decoded).
+        // Ten dense nodes all referencing the same 512-byte string entry (516 bytes each), plus
+        // one tagged way (527 bytes) and one drawn multipolygon relation (5136 bytes of roles/tags).
         let ids: Vec<i64> = (1..=10).collect();
-        let coords = vec![0i64; 10];
+        let coords: Vec<i64> = ids.iter().map(|i| i * 1_000_000).collect();
         let mut kv = Vec::new();
         for _ in 0..10 {
             kv.extend([1u64, 2, 0]);
@@ -1615,48 +1664,12 @@ pub(crate) mod tests {
         field_bytes(9, &delta(&coords), &mut dense);
         field_bytes(10, &packed_of(&kv), &mut dense);
 
-        let mut pg = Vec::new();
-        field_bytes(2, &dense, &mut pg);
-        let mut prim = Vec::new();
-        field_bytes(1, &st, &mut prim);
-        field_bytes(2, &pg, &mut prim);
-        blob("OSMData", &prim, true, &mut out);
+        let mut way = Vec::new();
+        field_varint(1, 100, &mut way);
+        field_bytes(2, &packed_of(&[6, 1]), &mut way);
+        field_bytes(3, &packed_of(&[7, 2]), &mut way);
+        field_bytes(8, &delta(&[1, 2]), &mut way);
 
-        // Under a 1024-byte budget, only the first 516-byte tagged node is kept and `capped` is set.
-        let capped = blocks_with_text_limit(&out, 1024).unwrap();
-        assert!(capped.capped, "extract past text budget must be marked capped");
-        assert_eq!(capped.points.len(), 1);
-        assert!(capped.text_bytes <= 1024);
-
-        let full = blocks_with_text_limit(&out, 64 * 1024).unwrap();
-        assert!(!full.capped);
-        assert_eq!(full.points.len(), 10);
-
-        // Discarded relations (type=route) must not charge the text budget or cap the extract.
-        let mut route_out = Vec::new();
-        blob("OSMHeader", &header, false, &mut route_out);
-        let mut route_pg = Vec::new();
-        for rid in 1..=10u64 {
-            let mut rel = Vec::new();
-            field_varint(1, rid, &mut rel);
-            field_bytes(2, &packed_of(&[3, 1]), &mut rel);
-            field_bytes(3, &packed_of(&[5, 2]), &mut rel);
-            field_bytes(8, &packed_of(&[2; 10]), &mut rel);
-            field_bytes(9, &delta(&ids), &mut rel);
-            field_bytes(10, &packed_of(&[1; 10]), &mut rel);
-            field_bytes(4, &rel, &mut route_pg);
-        }
-        let mut route_prim = Vec::new();
-        field_bytes(1, &st, &mut route_prim);
-        field_bytes(2, &route_pg, &mut route_prim);
-        blob("OSMData", &route_prim, true, &mut route_out);
-        let route_osm = blocks_with_text_limit(&route_out, 1024).unwrap();
-        assert!(!route_osm.capped, "discarded relations must not cap the extract");
-        assert_eq!(route_osm.text_bytes, 0);
-
-        // Drawn relation member roles referencing a repeated large string are capped too.
-        let mut rel_out = Vec::new();
-        blob("OSMHeader", &header, false, &mut rel_out);
         let mut rel = Vec::new();
         field_varint(1, 500, &mut rel);
         field_bytes(2, &packed_of(&[3]), &mut rel);
@@ -1664,20 +1677,62 @@ pub(crate) mod tests {
         field_bytes(8, &packed_of(&[2; 10]), &mut rel);
         field_bytes(9, &delta(&ids), &mut rel);
         field_bytes(10, &packed_of(&[1; 10]), &mut rel);
-        let mut rel_pg = Vec::new();
-        field_bytes(4, &rel, &mut rel_pg);
-        let mut rel_prim = Vec::new();
-        field_bytes(1, &st, &mut rel_prim);
-        field_bytes(2, &rel_pg, &mut rel_prim);
-        blob("OSMData", &rel_prim, true, &mut rel_out);
 
-        let capped_rel = blocks_with_text_limit(&rel_out, 1024).unwrap();
-        assert!(capped_rel.capped);
-        assert!(capped_rel.relations.is_empty());
-        assert!(capped_rel.text_bytes <= 1024);
+        let mut pg = Vec::new();
+        field_bytes(2, &dense, &mut pg);
+        field_bytes(3, &way, &mut pg);
+        field_bytes(4, &rel, &mut pg);
+        let mut prim = Vec::new();
+        field_bytes(1, &st, &mut prim);
+        field_bytes(2, &pg, &mut prim);
+        blob("OSMData", &prim, true, &mut out);
 
-        let full_rel = blocks_with_text_limit(&rel_out, 64 * 1024).unwrap();
-        assert!(!full_rel.capped);
-        assert_eq!(full_rel.relations.len(), 1);
+        // Under a 1024-byte budget: node 1 (516 bytes) fits, nodes 2..=10 (9 * 516 = 4644 bytes),
+        // the tagged way (527 bytes), and the drawn relation (16 + 5120 = 5136 bytes) are left out
+        // and reported with exact counts and byte total.
+        let layers = read_with_text_limit("cap.osm.pbf", &out, 1024).unwrap();
+        assert_eq!(layers.len(), 1, "only points remain after way and relation are omitted");
+        assert_eq!(layers[0].0.features.len(), 1);
+        let expected_bytes = 9 * 516 + 527 + (4 + 12 + 10 * 512);
+        let note = layers[0]
+            .1
+            .messages
+            .iter()
+            .find(|m| m.loss == Some(crate::loss::LossCode::DroppedOverLimit))
+            .expect("must emit a DroppedOverLimit notice");
+        assert_eq!(
+            note.as_str(),
+            format!(
+                "OSM tag/role text reached the 1024-byte limit: 9 tagged nodes (tags dropped in points), 1 tagged way (omitted from lines/multipolygons), 1 relation (omitted from multipolygons) ({expected_bytes} bytes of text left out)"
+            )
+        );
+
+        // Within a generous budget, no text-budget notice is emitted.
+        let full = read_with_text_limit("cap.osm.pbf", &out, 64 * 1024).unwrap();
+        assert_eq!(full[0].0.features.len(), 10);
+        assert_eq!(full[1].0.features.len(), 1);
+        assert!(!full[0].1.messages.iter().any(|m| m.loss == Some(crate::loss::LossCode::DroppedOverLimit)));
+
+        // Discarded relations (type=route) must not charge the text budget or emit a notice.
+        let mut route_out = Vec::new();
+        blob("OSMHeader", &header, false, &mut route_out);
+        let mut route_pg = Vec::new();
+        for rid in 1..=10u64 {
+            let mut r = Vec::new();
+            field_varint(1, rid, &mut r);
+            field_bytes(2, &packed_of(&[3, 1]), &mut r);
+            field_bytes(3, &packed_of(&[5, 2]), &mut r);
+            field_bytes(8, &packed_of(&[2; 10]), &mut r);
+            field_bytes(9, &delta(&ids), &mut r);
+            field_bytes(10, &packed_of(&[1; 10]), &mut r);
+            field_bytes(4, &r, &mut route_pg);
+        }
+        let mut route_prim = Vec::new();
+        field_bytes(1, &st, &mut route_prim);
+        field_bytes(2, &route_pg, &mut route_prim);
+        blob("OSMData", &route_prim, true, &mut route_out);
+        let route_osm = blocks_with_text_limit(&route_out, 1024).unwrap();
+        assert_eq!(route_osm.text_bytes, 0);
+        assert_eq!(route_osm.text_capped_relations, 0);
     }
 }

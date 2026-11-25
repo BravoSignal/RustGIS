@@ -2779,7 +2779,7 @@ fn read_csv_records(
         || DataError::Format(format!("CSV retained table exceeds the {allowance}-byte remaining memory budget; import a smaller file"));
     let header = reader.headers().map_err(refused)?;
     let mut left = budget.checked_sub(cost(header, header.len())).ok_or_else(too_large)?;
-    let headers: Vec<String> = header.iter().map(str::to_string).collect();
+    let headers: Vec<String> = header.iter().map(unguard_header).collect();
     let mut malformed = 0;
     let mut rows = Vec::new();
     for record in reader.records() {
@@ -3289,6 +3289,21 @@ pub(crate) fn csv_cell(v: &Value) -> String {
     }
 }
 
+/// A CSV header name, prefixed with an apostrophe when it starts like a spreadsheet formula
+/// (or starts with apostrophes before one, so [`unguard_header`] reverses it losslessly).
+pub(crate) fn csv_header(name: &str) -> String {
+    if csv_needs_guard(name.trim_start_matches('\'')) { format!("'{name}") } else { name.to_string() }
+}
+
+/// Reverses [`csv_header`]: strips one leading apostrophe only when what follows would be guarded
+/// on export, so literal leading apostrophes round-trip unchanged.
+fn unguard_header(header: &str) -> String {
+    match header.strip_prefix('\'') {
+        Some(rest) if csv_needs_guard(rest.trim_start_matches('\'')) => rest.to_string(),
+        _ => header.to_string(),
+    }
+}
+
 /// The names of a point layer's longitude and latitude columns in CSV: the first of the names
 /// reading takes for each that no field has, ignoring case and the spaces around a name (reading
 /// trims them).
@@ -3352,7 +3367,7 @@ impl<W: std::io::Write> CsvWriter<W> {
             // The coordinate columns come first, before any attributes using recognised names.
             head.extend(csv_names_in(fields, crs));
         }
-        head.extend(fields.iter().map(|f| f.name.clone()));
+        head.extend(fields.iter().map(|f| csv_header(&f.name)));
         w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
         Ok(CsvWriter { w, point })
     }
