@@ -3269,7 +3269,7 @@ const FORMULA_START: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 /// Text needs an apostrophe if it starts like a spreadsheet formula. The numeric exception
 /// keeps finite numbers that fit Double precision and have at most 15 significant digits.
 /// A leading-zero code stays guarded unless its mantissa has digits after a decimal point.
-fn csv_needs_guard(text: &str) -> bool {
+pub(crate) fn csv_needs_guard(text: &str) -> bool {
     if !text.starts_with(FORMULA_START) {
         return false;
     }

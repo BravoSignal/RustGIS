@@ -937,6 +937,7 @@ fn row_offsets(x: &[u8]) -> Result<Vec<(u64, usize)>> {
         Some(bits) => total.div_ceil(1024).min(bits.len().saturating_mul(8)),
     };
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut stored_before = 0usize;
     for block in 0..in_blocks {
         let present = bitmap.is_none_or(|bits| bits.get(block / 8).is_some_and(|b| b >> (block % 8) & 1 == 1));
@@ -960,6 +961,9 @@ fn row_offsets(x: &[u8]) -> Result<Vec<(u64, usize)>> {
                 continue;
             }
             if let Ok(offset) = usize::try_from(offset) {
+                if !seen.insert(offset) {
+                    return Err(bad("duplicate row offset"));
+                }
                 out.push((row as u64 + 1, offset));
             }
         }
@@ -1005,7 +1009,11 @@ fn decode_geometry(b: &[u8], def: &GeomDef, budget: &mut usize) -> std::result::
             if vx == 0 || vy == 0 {
                 return Ok(Decoded::Empty);
             }
-            Ok(Decoded::Geometry(Geometry::Point(Coord::new(x((vx - 1) as f64), y((vy - 1) as f64))), 0))
+            let (px, py) = (x((vx - 1) as f64), y((vy - 1) as f64));
+            if !px.is_finite() || !py.is_finite() {
+                return Err(());
+            }
+            Ok(Decoded::Geometry(Geometry::Point(Coord::new(px, py)), 0))
         }
         // Multipoints.
         8 | 18 | 20 | 28 | 53 => {
@@ -1112,7 +1120,11 @@ fn deltas(c: &mut Cur, n: usize, def: &GeomDef) -> std::result::Result<Vec<Coord
     for _ in 0..n {
         dx = dx.checked_add(c.varint().ok_or(())?).ok_or(())?;
         dy = dy.checked_add(c.varint().ok_or(())?).ok_or(())?;
-        pts.push(Coord::new(dx as f64 / def.xy_scale + def.x0, dy as f64 / def.xy_scale + def.y0));
+        let (x, y) = (dx as f64 / def.xy_scale + def.x0, dy as f64 / def.xy_scale + def.y0);
+        if !x.is_finite() || !y.is_finite() {
+            return Err(());
+        }
+        pts.push(Coord::new(x, y));
     }
     Ok(pts)
 }
@@ -1147,48 +1159,72 @@ pub(crate) fn signed_area(ring: &[Coord]) -> f64 {
 }
 
 /// A multipatch's faces, each its outer ring and then its holes: triangles from strips, fans and
-/// triangle lists, and rings. At most [`MAX_FACES`]; the flag says some were left out.
+/// triangle lists, and rings. At most [`MAX_FACES`] rings in total; the flag says some were left
+/// out.
 fn faces(parts: &[Vec<P3>], kinds: &[u64]) -> (Vec<Vec<Vec<P3>>>, bool) {
+    faces_limited(parts, kinds, MAX_FACES)
+}
+
+fn faces_limited(parts: &[Vec<P3>], kinds: &[u64], limit: usize) -> (Vec<Vec<Vec<P3>>>, bool) {
     let mut faces: Vec<Vec<Vec<P3>>> = Vec::new();
+    let mut rings = 0usize;
     let mut truncated = false;
     for (part, &kind) in parts.iter().zip(kinds) {
-        // Faces past the cap are left out, within a part too (one strip can hold millions).
-        let room = MAX_FACES.saturating_sub(faces.len());
+        // Faces and inner rings past the cap are left out, within a part too (one strip can hold millions).
+        let room = limit.saturating_sub(rings);
         let has = match kind {
             0 | 1 => part.len().saturating_sub(2),
             6 => part.len() / 3,
-            3 => 0,
             _ => 1,
         };
         if has > room {
             truncated = true;
         }
         if room == 0 {
-            break;
+            if truncated {
+                break;
+            }
+            continue;
         }
         match kind {
             // Triangle strip, fan, triangles.
-            0 => faces.extend(part.windows(3).take(room).map(|w| vec![w.to_vec()])),
+            0 => {
+                let take = part.len().saturating_sub(2).min(room);
+                faces.extend(part.windows(3).take(take).map(|w| vec![w.to_vec()]));
+                rings += take;
+            }
             1 => {
                 if let Some((first, rest)) = part.split_first() {
+                    let take = rest.len().saturating_sub(1).min(room);
                     faces.extend(
                         rest.windows(2)
                             .filter_map(|w| match w {
                                 [a, b] => Some(vec![vec![*first, *a, *b]]),
                                 _ => None,
                             })
-                            .take(room),
+                            .take(take),
                     );
+                    rings += take;
                 }
             }
-            6 => faces.extend(part.as_chunks::<3>().0.iter().take(room).map(|w| vec![w.to_vec()])),
+            6 => {
+                let take = (part.len() / 3).min(room);
+                faces.extend(part.as_chunks::<3>().0.iter().take(take).map(|w| vec![w.to_vec()]));
+                rings += take;
+            }
             // An inner ring is a hole in the face before.
-            3 => match faces.last_mut() {
-                Some(face) => face.push(part.clone()),
-                None => faces.push(vec![part.clone()]),
-            },
+            3 => {
+                match faces.last_mut() {
+                    Some(face) => face.push(part.clone()),
+                    None => faces.push(vec![part.clone()]),
+                }
+                rings += 1;
+            }
             // Outer, first and plain rings.
-            _ => faces.push(vec![part.clone()]),
+            _ => {
+                faces.push(vec![part.clone()]);
+                rings += 1;
+            }
         }
     }
     (faces, truncated)

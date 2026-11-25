@@ -24,6 +24,9 @@ const MAX_MEMBERS: usize = 100_000;
 const MAX_WAYS: usize = MAX_NODES / 4;
 const MAX_REFS: usize = MAX_NODES * 2;
 const MAX_RELATIONS: usize = MAX_NODES / 40;
+/// The most decoded tag and role text bytes kept across an OSM PBF file: a small compressed block
+/// can repeat one string-table entry across thousands of entities.
+const MAX_TEXT_BYTES: usize = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 256 << 20 };
 
 /// Keys with a field of their own (as GDAL's OSM driver gives them).
 const KEYS: &[&str] = &[
@@ -256,12 +259,21 @@ fn ignored(key: &str) -> bool {
         || key.starts_with("openGeoDB:")
 }
 
-fn tags(strings: &[String], keys: &[u64], vals: &[u64]) -> Tags {
-    keys.iter()
-        .zip(vals)
-        .filter_map(|(k, v)| Some((strings.get(usize::try_from(*k).ok()?)?.clone(), strings.get(usize::try_from(*v).ok()?)?.clone())))
-        .filter(|(k, _)| !ignored(k))
-        .collect()
+fn tags(osm: &mut Osm, strings: &[String], keys: &[u64], vals: &[u64]) -> Result<Tags> {
+    let mut out = Vec::new();
+    for (k, v) in keys.iter().zip(vals) {
+        let (Some(k), Some(v)) =
+            (usize::try_from(*k).ok().and_then(|i| strings.get(i)), usize::try_from(*v).ok().and_then(|i| strings.get(i)))
+        else {
+            continue;
+        };
+        if ignored(k) {
+            continue;
+        }
+        osm.charge_text(k.len().saturating_add(v.len()))?;
+        out.push((k.clone(), v.clone()));
+    }
+    Ok(out)
 }
 
 fn tag<'t>(t: &'t [(String, String)], k: &str) -> Option<&'t str> {
@@ -269,7 +281,6 @@ fn tag<'t>(t: &'t [(String, String)], k: &str) -> Option<&'t str> {
 }
 
 /// What was read: nodes (sorted by id), tagged nodes, ways, and relations.
-#[derive(Default)]
 struct Osm {
     nodes: Vec<(i64, i32, i32)>,
     points: Vec<(i64, Coord, Tags)>,
@@ -281,6 +292,34 @@ struct Osm {
     capped: bool,
     /// Members omitted at the per-relation limit; wide enough for all bounded relations.
     omitted_members: u64,
+    /// Cumulative bytes of decoded tag and role strings retained across the file.
+    text_bytes: usize,
+    text_limit: usize,
+}
+
+impl Osm {
+    fn with_text_limit(text_limit: usize) -> Self {
+        Osm {
+            nodes: Vec::new(),
+            points: Vec::new(),
+            ways: Vec::new(),
+            refs: 0,
+            relations: Vec::new(),
+            capped: false,
+            omitted_members: 0,
+            text_bytes: 0,
+            text_limit,
+        }
+    }
+
+    fn charge_text(&mut self, bytes: usize) -> Result<()> {
+        let next = self.text_bytes.saturating_add(bytes);
+        if next > self.text_limit {
+            return Err(DataError::Format(format!("OSM PBF decoded text exceeds the limit of {} bytes", self.text_limit)));
+        }
+        self.text_bytes = next;
+        Ok(())
+    }
 }
 
 /// Degrees from OSM's fixed point (1e-7°), and back.
@@ -346,7 +385,8 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                             _ => {}
                         }
                     }
-                    keep(osm, id, lat, lon, tags(&strings, &k, &vv));
+                    let t = tags(osm, &strings, &k, &vv)?;
+                    keep(osm, id, lat, lon, t);
                 }
                 // Dense nodes.
                 2 => {
@@ -374,6 +414,7 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                             if let (Some(k), Some(v)) = (at(k), at(v))
                                 && !ignored(k)
                             {
+                                osm.charge_text(k.len().saturating_add(v.len()))?;
                                 t.push((k.clone(), v.clone()));
                             }
                         }
@@ -407,8 +448,9 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                             .map(|(la, lo)| Coord::new(nano(lon_off, *lo) as f64 * 1e-9, nano(lat_off, *la) as f64 * 1e-9))
                             .collect()
                     });
+                    let t = tags(osm, &strings, &k, &vv)?;
                     osm.refs += refs.len();
-                    osm.ways.push((id, refs, tags(&strings, &k, &vv), places));
+                    osm.ways.push((id, refs, t, places));
                 }
                 // A relation.
                 4 => {
@@ -435,7 +477,7 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                             previous
                         })
                         .collect();
-                    let t = tags(&strings, &k, &vv);
+                    let t = tags(osm, &strings, &k, &vv)?;
                     // Only the relations drawn are kept, so only they meet the cap: one of
                     // another type is left out either way.
                     let drawn = matches!(tag(&t, "type"), Some("multipolygon" | "boundary"));
@@ -454,15 +496,12 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
                         // left out by it.
                         let omitted = types.iter().skip(MAX_MEMBERS).filter(|ty| **ty != 0).count() as u64;
                         osm.omitted_members = osm.omitted_members.saturating_add(omitted);
-                        let members = mems
-                            .into_iter()
-                            .zip(types)
-                            .zip(roles)
-                            .take(MAX_MEMBERS)
-                            .map(|((m, ty), role)| {
-                                (ty, m, usize::try_from(role).ok().and_then(|r| strings.get(r)).cloned().unwrap_or_default())
-                            })
-                            .collect();
+                        let mut members = Vec::new();
+                        for ((m, ty), role) in mems.into_iter().zip(types).zip(roles).take(MAX_MEMBERS) {
+                            let role = usize::try_from(role).ok().and_then(|r| strings.get(r)).map(String::as_str).unwrap_or("");
+                            osm.charge_text(role.len())?;
+                            members.push((ty, m, role.to_string()));
+                        }
                         osm.relations.push((id, members, t));
                     }
                 }
@@ -475,7 +514,11 @@ fn block(osm: &mut Osm, data: &[u8]) -> Result<()> {
 
 /// Reads the file's blocks.
 fn blocks(bytes: &[u8]) -> Result<Osm> {
-    let mut osm = Osm::default();
+    blocks_with_text_limit(bytes, MAX_TEXT_BYTES)
+}
+
+fn blocks_with_text_limit(bytes: &[u8], text_limit: usize) -> Result<Osm> {
+    let mut osm = Osm::with_text_limit(text_limit);
     let mut i = 0usize;
     let mut saw_header = false;
     while i < bytes.len() {
@@ -1473,5 +1516,63 @@ pub(crate) mod tests {
         probe.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         let _g = crate::progress::install(Some(probe));
         assert!(matches!(read("a.osm.pbf", &sample()), Err(DataError::Cancelled)));
+    }
+
+    #[test]
+    fn string_table_amplification_is_capped() {
+        let mut out = Vec::new();
+        let mut header = Vec::new();
+        field_bytes(4, b"OsmSchema-V0.6", &mut header);
+        field_bytes(4, b"DenseNodes", &mut header);
+        blob("OSMHeader", &header, false, &mut out);
+
+        let big = "x".repeat(512);
+        let mut st = Vec::new();
+        for s in ["", "name", big.as_str(), "type", "multipolygon"] {
+            field_bytes(1, s.as_bytes(), &mut st);
+        }
+        // Ten dense nodes all referencing the same 512-byte string entry (> 5 KiB decoded).
+        let ids: Vec<i64> = (1..=10).collect();
+        let coords = vec![0i64; 10];
+        let mut kv = Vec::new();
+        for _ in 0..10 {
+            kv.extend([1u64, 2, 0]);
+        }
+        let mut dense = Vec::new();
+        field_bytes(1, &delta(&ids), &mut dense);
+        field_bytes(8, &delta(&coords), &mut dense);
+        field_bytes(9, &delta(&coords), &mut dense);
+        field_bytes(10, &packed_of(&kv), &mut dense);
+
+        let mut pg = Vec::new();
+        field_bytes(2, &dense, &mut pg);
+        let mut prim = Vec::new();
+        field_bytes(1, &st, &mut prim);
+        field_bytes(2, &pg, &mut prim);
+        blob("OSMData", &prim, true, &mut out);
+
+        let err = blocks_with_text_limit(&out, 1024).err().expect("must fail when text exceeds limit");
+        assert!(matches!(err, DataError::Format(ref m) if m.contains("limit")), "{err}");
+        assert!(blocks_with_text_limit(&out, 64 * 1024).is_ok());
+
+        // Relation member roles referencing a repeated large string are budgeted too.
+        let mut rel_out = Vec::new();
+        blob("OSMHeader", &header, false, &mut rel_out);
+        let mut rel = Vec::new();
+        field_varint(1, 500, &mut rel);
+        field_bytes(2, &packed_of(&[3]), &mut rel);
+        field_bytes(3, &packed_of(&[4]), &mut rel);
+        field_bytes(8, &packed_of(&[2; 10]), &mut rel);
+        field_bytes(9, &delta(&ids), &mut rel);
+        field_bytes(10, &packed_of(&[1; 10]), &mut rel);
+        let mut rel_pg = Vec::new();
+        field_bytes(4, &rel, &mut rel_pg);
+        let mut rel_prim = Vec::new();
+        field_bytes(1, &st, &mut rel_prim);
+        field_bytes(2, &rel_pg, &mut rel_prim);
+        blob("OSMData", &rel_prim, true, &mut rel_out);
+
+        assert!(matches!(blocks_with_text_limit(&rel_out, 1024), Err(DataError::Format(_))));
+        assert!(blocks_with_text_limit(&rel_out, 64 * 1024).is_ok());
     }
 }

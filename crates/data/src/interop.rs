@@ -523,7 +523,7 @@ impl WktParser {
 /// A [`to_wkt_csv`] cell's text before quoting: text starting like a formula is prefixed with `'`
 /// so spreadsheets show it rather than run it.
 pub(crate) fn wkt_csv_text(s: &str) -> String {
-    if s.starts_with(['=', '+', '-', '@']) && s.parse::<f64>().is_err() { format!("'{s}") } else { s.to_string() }
+    if crate::io::csv_needs_guard(s) { format!("'{s}") } else { s.to_string() }
 }
 
 /// CSV with a `wkt` geometry column and every attribute; cancellable between features.
@@ -608,5 +608,15 @@ mod tests {
         assert!(to_gpx(&numbered, Some(0)).unwrap().contains("<name>0.1234567891</name>"));
         let c = to_wkt_csv(&ds).unwrap();
         assert!(c.contains("POINT (1 2),,0.1234567891\n") && c.contains(",B,0.000000001\n"), "{c}");
+    }
+
+    #[test]
+    fn wkt_csv_formula_guard_matches_csv() {
+        for guarded in ["=SUM(A1)", "@cmd", "\t=1", "\r+1", "+Inf", "-NaN", "+0123", "-007", "+1234567890123456", "-1234567890123456"] {
+            assert_eq!(wkt_csv_text(guarded), format!("'{guarded}"), "{guarded:?}");
+        }
+        for plain in ["-12.5", "+42", "-0.5", "Paris"] {
+            assert_eq!(wkt_csv_text(plain), plain, "{plain:?}");
+        }
     }
 }
