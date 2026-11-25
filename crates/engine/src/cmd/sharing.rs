@@ -563,20 +563,24 @@ fn css(c: Rgba) -> String {
 /// is left out, counted in `unplaced`; visible features past `budget` are counted in `limited`.
 fn styled_features(l: &Layer, budget: &mut usize, unplaced: &mut Unplaced, limited: &mut usize) -> Result<Vec<Value>, String> {
     let rows = l.visible_rows();
+    if *budget == 0 {
+        *limited += rows.iter().filter(|&&v| v).count();
+        return Ok(Vec::new());
+    }
     let opacity = 1.0 - f64::from(l.transparency.clamp(0.0, 100.0)) / 100.0;
     let mut out = Vec::new();
     // Its symbol by expression (no map scale: the page zooms on its own).
     let styler = l.styler(None);
     let to = l.dataset.lonlat_conversion().map_err(|e| format!("{}: {e}", l.name))?;
     for (row, ft) in l.dataset.features.rows().enumerate() {
+        if *budget == 0 {
+            *limited += rows.get(row..).map_or(0, |tail| tail.iter().filter(|&&v| v).count());
+            break;
+        }
         if rows.get(row) != Some(&true) {
             continue;
         }
         let Some(g) = ft.geometry() else { continue };
-        if *budget == 0 {
-            *limited += 1;
-            continue;
-        }
         let Ok(g) = rustgis_data::Dataset::geometry_to_lonlat_by(&to, g) else {
             unplaced.add(&l.name, 1);
             continue;
@@ -994,13 +998,13 @@ fn locator(l: &Layer, fields: Option<&[String]>, unplaced: &mut Unplaced, limite
     let mut entries = Vec::new();
     let mut taken = 0usize;
     for (row, ft) in ds.features.iter().enumerate() {
+        if taken >= MAX_FEATURES {
+            *limited = ds.features.len().saturating_sub(row);
+            break;
+        }
         let Some(g) = &ft.geometry else { continue };
         let e = g.extent();
         if e.is_empty() {
-            continue;
-        }
-        if taken >= MAX_FEATURES {
-            *limited += 1;
             continue;
         }
         let c = match g {

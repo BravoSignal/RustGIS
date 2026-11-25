@@ -103,10 +103,124 @@ fn s3_list_by_bucket_does_not_attach_reserved_credentials_for_agent_or_assistant
     // Assistant approved for Network (not Reserved) must also not attach the signed connection.
     let assistant = assistant_scope(29001);
     let p = pending(&s, &assistant, &call);
-    assert!(s.run_permitted(assistant, p.allow(), &call).is_err(), "assistant must not list through the signed session connection");
+    assert!(s.run_permitted(assistant.clone(), p.allow(), &call).is_err(), "assistant must not list through the signed session connection");
     assert!(seen.lock().unwrap().is_empty(), "assistant listing must not reach the signed endpoint");
 
+    // Implicit AWS connection (no custom endpoint): non-reserved scopes must wrap the list URL as
+    // anonymous so transport `s3::prepare` / `signer_for` never signs it with the implicit bucket
+    // credentials either.
+    use crate::render::rustgis_tiles::s3;
+    let aws_bucket = "aws-signed-guard-bucket";
+    s.run(
+        "s3.connect",
+        &json!({
+            "name": "signed-aws-implicit",
+            "buckets": [aws_bucket],
+            "accessKeyId": "fixture-aws-id",
+            "secretAccessKey": "fixture-aws-secret"
+        }),
+    )
+    .unwrap();
+    let user_url = crate::cmd::s3::bucket_list_url(&s, aws_bucket, "", None, None).unwrap();
+    let user_prep = s3::prepare(&user_url).unwrap();
+    assert!(user_prep.signed, "user scope should sign implicit AWS bucket listing");
+
+    let agent = agent_scope(AgentAccess::Allow, "s3-aws-agent");
+    let agent_url = s.with_scope(agent, |s| crate::cmd::s3::bucket_list_url(s, aws_bucket, "", None, None)).unwrap().unwrap();
+    assert!(s3::split_anonymous(&agent_url).1, "agent list URL must be marked anonymous: {agent_url}");
+    let agent_prep = s3::prepare(&agent_url).unwrap();
+    assert!(!agent_prep.signed && agent_prep.anonymous && agent_prep.headers.is_empty(), "agent list URL must not be signed");
+
+    let asst_url = s.with_scope(assistant, |s| crate::cmd::s3::bucket_list_url(s, aws_bucket, "", None, None)).unwrap().unwrap();
+    assert!(s3::split_anonymous(&asst_url).1, "assistant list URL must be marked anonymous: {asst_url}");
+    let asst_prep = s3::prepare(&asst_url).unwrap();
+    assert!(!asst_prep.signed && asst_prep.anonymous && asst_prep.headers.is_empty(), "assistant list URL must not be signed");
+
+    let _ = s.run("s3.disconnect", &json!({"name": "signed-aws-implicit"}));
     let _ = s.run("s3.disconnect", &json!({"name": "signed-local"}));
+}
+
+/// Review fix: `open_peer_text(Peer::Embedder, ...)` runs under `Scope::peer()` and must never
+/// load remembered database or S3 credentials from the secret store.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn peer_embedder_open_peer_text_never_loads_remembered_credentials() {
+    if isolate_process_test("tests::engine_guards::peer_embedder_open_peer_text_never_loads_remembered_credentials") {
+        return;
+    }
+    use rustgis_data::{Dataset, Field, FieldType, GeometryType};
+    use rustgis_map::Layer;
+    use rustgis_map::source::{PostgisOrigin, SourceLayer};
+
+    let store = Arc::new(CountingSecrets::new());
+    let mut setup = Session::new(Project::default());
+    setup.database_logins.set_store(Some(store.clone()));
+
+    let pg_addr = "postgresql://reader@127.0.0.1:1/embedder_db";
+    let pg_id = setup.run("connection.new", &json!({"kind": "postgres", "name": "EmbedderPg", "address": pg_addr})).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    setup.run("connection.login", &json!({"id": pg_id, "password": "fixture-embedder-pw", "remember": true})).unwrap();
+
+    let s3_id = setup
+        .run(
+            "connection.new",
+            &json!({
+                "kind": "s3",
+                "name": "EmbedderS3",
+                "address": "http://127.0.0.1:9",
+                "options": {"credentials": "keys", "buckets": "embedder-bucket", "region": "us-east-1"}
+            }),
+        )
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    setup
+        .run(
+            "connection.login",
+            &json!({
+                "id": s3_id,
+                "accessKeyId": "fixture-embedder-key",
+                "secretAccessKey": "fixture-embedder-secret",
+                "remember": true
+            }),
+        )
+        .unwrap();
+    let _ = setup.run("s3.disconnect", &json!({"name": "EmbedderS3"}));
+
+    let definitions = setup.connections.to_json();
+    crate::cmd::connections::clear_active();
+    let mut s = Session::new(Project::default());
+    s.database_logins.set_store(Some(store.clone()));
+    s.connections = crate::connections::Connections::from_json(&definitions);
+
+    let mut incoming = Project::default();
+    let mut pg_layer = Layer::new(1, Dataset::new("EmbedderPgLayer", GeometryType::Point, vec![Field::new("id", FieldType::Integer)]));
+    let mut pg_src = SourceLayer::default();
+    pg_src.postgis = Some(PostgisOrigin {
+        database: pg_addr.into(),
+        table: "public.parcels".into(),
+        crs: None,
+        family: Some(rustgis_data::source::Family::Points),
+    });
+    pg_layer.source = Some(pg_src);
+    incoming.map_mut().add_layer(pg_layer);
+
+    let mut s3_layer = Layer::new(2, Dataset::new("EmbedderS3Layer", GeometryType::Point, vec![Field::new("id", FieldType::Integer)]));
+    let mut s3_src = SourceLayer::default();
+    s3_src.path = Some(rustgis_data::s3_address::bind("", "http://127.0.0.1:9", "s3://embedder-bucket/data.fgb").unwrap());
+    s3_layer.source = Some(s3_src);
+    incoming.map_mut().add_layer(s3_layer);
+
+    let incoming_json = serde_json::to_string(&incoming).unwrap();
+    let loads_before = store.loads();
+    let report = s.open_peer_text(crate::Peer::Embedder, &incoming_json).unwrap();
+    assert_eq!(report.reconnect, 1, "incoming database layer must require reconnect");
+    assert_eq!(store.loads(), loads_before, "Peer::Embedder must not load remembered credentials");
+    assert!(s.database_logins.activations().is_empty(), "Peer::Embedder must not activate DB logins");
+    assert!(s.s3_binding(&s3_id).is_none(), "Peer::Embedder must not bind saved S3 logins");
 }
 
 /// Fix 2: `connection_logins::resolve` and `s3_connections::resolve_project_s3` must not resolve
