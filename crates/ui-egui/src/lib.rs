@@ -2690,9 +2690,6 @@ impl RustGisApp {
         };
         if rustgis_engine::project::is_project_file(name) {
             let r = self.run_by_user("project.openText", json!({"text": text, "fileName": name}));
-            if r.is_ok() && !saveprompt::waiting(self) {
-                self.ui.web_file = Some(format!("{}.rgis", self.session.project.name));
-            }
             self.map.invalidate();
             r
         } else {
@@ -3266,11 +3263,30 @@ impl RustGisApp {
         let report = self.session.open_peer_text(rustgis_engine::Peer::Embedder, text)?;
         assistantpane::peer_replaced(self);
         self.reset_replaced_project();
+        self.sync_after_session_change();
         layoutview::follow_project(self);
         for notice in report.notices() {
             self.session.notify(notice, false);
         }
         Ok(())
+    }
+
+    /// Reconciles UI handles (active edit drags, annotations, pending symbology pick, table views)
+    /// with the current session after a command or peer project replacement.
+    fn sync_after_session_change(&mut self) {
+        // Nested commands (including scripts) can replace rows too; never retarget a chosen
+        // vertex or held gesture to the replacement feature at the same row.
+        crate::vertexedit::cancel_stale_drag(self);
+        annotation::sync(self);
+        crate::boxedit::cancel_stale(self);
+        crate::circleedit::cancel_stale(self);
+        // Commands can replace the project, switch maps or change the renderer while the pane
+        // is closed. A field picked for the old context must not overwrite the new renderer.
+        if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
+            self.ui.symbology_pending = None;
+        }
+        // Fields and layers can go while the table is closed: its column views follow them.
+        table::prune_views(self);
     }
 
     /// Clears UI state bound to the previous project after either ordinary or peer replacement.
@@ -3280,13 +3296,6 @@ impl RustGisApp {
         self.map.deleting = None;
         self.map.cancel_sketch();
         pluginpanel::cancel_pick(self);
-        crate::vertexedit::cancel_stale_drag(self);
-        annotation::sync(self);
-        crate::boxedit::cancel_stale(self);
-        crate::circleedit::cancel_stale(self);
-        if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
-            self.ui.symbology_pending = None;
-        }
         // Nor are a spectral profile's points read on a namesake raster of the new one.
         self.workflow.spectral.clear();
         crate::analysispane::forget_similar(&mut self.workflow);
@@ -3304,7 +3313,6 @@ impl RustGisApp {
         // its layer never lands in the new one, and said, as a download landing late is. A plugin
         // command waiting for it went with the old project's waits.
         self.retire_cog_probes();
-        table::prune_views(self);
     }
 
     /// Reports pending header reads retired by either ordinary or peer project replacement.
@@ -3524,12 +3532,6 @@ impl RustGisApp {
             // Esc chooses Explore: a plugin's pick stops waiting for the map, as for any tool.
             pluginpanel::cancel_pick(self);
         }
-        // Nested commands (including scripts) can replace rows too; never retarget a chosen
-        // vertex or held gesture to the replacement feature at the same row.
-        crate::vertexedit::cancel_stale_drag(self);
-        annotation::sync(self);
-        crate::boxedit::cancel_stale(self);
-        crate::circleedit::cancel_stale(self);
         if let Err(e) = &r {
             self.command_failed(id, e, notice_mark);
         }
@@ -3544,18 +3546,18 @@ impl RustGisApp {
         {
             self.keep_refused(&e);
         }
-        // Commands can replace the project, switch maps or change the renderer while the pane
-        // is closed. A field picked for the old context must not overwrite the new renderer.
-        if self.ui.symbology_pending.as_ref().is_some_and(|pending| !pending.is_current(&self.session)) {
-            self.ui.symbology_pending = None;
-        }
         // A project replacing this one hasn't been saved in the browser yet (opening a file
-        // names it again).
+        // names it again, including when deferred through the save prompt).
         if r.is_ok() && matches!(id, "project.new" | "project.sample" | "project.open" | "project.openText" | "project.fromTemplate") {
             self.reset_replaced_project();
+            if id == "project.openText"
+                && params.get("fileName").and_then(Value::as_str).is_some_and(|name| !name.is_empty())
+                && params.get("package").and_then(Value::as_bool) != Some(true)
+            {
+                self.ui.web_file = Some(format!("{}.rgis", self.session.project.name));
+            }
         }
-        // Fields and layers can go while the table is closed: its column views follow them.
-        table::prune_views(self);
+        self.sync_after_session_change();
         // Undo and redo can move vertices: an index chosen before may now name another vertex.
         // A step moved or deleted, from the pane, Command Search, the assistant or a script: the
         // step being edited (and the current one) follow it, so Save writes where it was typed.
@@ -10082,25 +10084,50 @@ mod peer_output_tests {
     }
 
     /// Opening a project, package, or template via `open_bytes` when unsaved edits exist and
-    /// `save_project` is present asks the save prompt instead of silently discarding edits.
+    /// `save_project` is present asks the save prompt instead of silently discarding edits, and
+    /// sets `ui.web_file` once a deferred `.rgis` replacement completes.
     #[test]
     fn open_bytes_with_asks_to_save_unsaved_edits_before_replacing() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
         let (other_text, _) = Project::default().saved_text(None).unwrap();
         let pkg_bytes = rustgis_engine::data::zip::write(&[("other.rgis".into(), other_text.as_bytes().to_vec())]).unwrap();
 
-        for (file, bytes) in
-            [("other.rgis", other_text.as_bytes()), ("other.rgispkg", pkg_bytes.as_slice()), ("other.rgistemplate", other_text.as_bytes())]
-        {
+        for (file, bytes, expected_web_file) in [
+            ("other.rgis", other_text.as_bytes(), Some("other.rgis")),
+            ("other.rgispkg", pkg_bytes.as_slice(), None),
+            ("other.rgistemplate", other_text.as_bytes(), None),
+        ] {
             let mut app = RustGisApp::with_sample();
             app.services.open_async = Some(Box::new(|_| {}));
             app.services.save_project = Some(Box::new(|_, _, _| Ok(())));
             app.run("map.rename", json!({"name": "Unsaved Map"})).unwrap();
             assert!(app.session.dirty());
 
-            app.open_bytes(file, bytes).unwrap();
-            assert!(saveprompt::waiting(&app), "{file}: expected save prompt to wait for user answer");
-            assert_eq!(app.session.map().name, "Unsaved Map", "{file}: unsaved edits must not be discarded yet");
-            assert!(app.ui.web_file.is_none(), "{file}: web_file must not be set while waiting on save prompt");
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 860.0)).with_max_steps(64).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+            h.state_mut().open_bytes(file, bytes).unwrap();
+            assert!(saveprompt::waiting(h.state()), "{file}: expected save prompt to wait for user answer");
+            assert_eq!(h.state().session.map().name, "Unsaved Map", "{file}: unsaved edits must not be discarded yet");
+            assert!(h.state().ui.web_file.is_none(), "{file}: web_file must not be set while waiting on save prompt");
+
+            for _ in 0..3 {
+                h.step();
+            }
+            h.get_by_role_and_label(Role::Button, "Don't Save").click();
+            for _ in 0..3 {
+                h.step();
+            }
+            assert!(!saveprompt::waiting(h.state()), "{file}: replacement should complete after Don't Save");
+            assert_ne!(h.state().session.map().name, "Unsaved Map", "{file}: project should be replaced after Don't Save");
+            assert_eq!(h.state().ui.web_file.as_deref(), expected_web_file, "{file}: web_file after deferred replacement");
         }
     }
 
