@@ -967,7 +967,7 @@ fn read_with_text_limit(file_name: &str, bytes: &[u8], text_limit: usize) -> Res
         let mut parts = Vec::new();
         if osm.text_capped_nodes > 0 {
             let n = osm.text_capped_nodes;
-            parts.push(format!("{n} {} (tags dropped in points)", if n == 1 { "tagged node" } else { "tagged nodes" }));
+            parts.push(format!("{n} {} (left out of points)", if n == 1 { "tagged node" } else { "tagged nodes" }));
         }
         if osm.text_capped_ways > 0 {
             let n = osm.text_capped_ways;
@@ -1739,7 +1739,7 @@ pub(crate) mod tests {
         assert_eq!(
             note.as_str(),
             format!(
-                "OSM tag/role text reached the 1800-byte limit: 9 tagged nodes (tags dropped in points), 1 tagged way (omitted from lines/multipolygons), 1 relation (omitted from multipolygons) ({expected_bytes} bytes of text left out)"
+                "OSM tag/role text reached the 1800-byte limit: 9 tagged nodes (left out of points), 1 tagged way (omitted from lines/multipolygons), 1 relation (omitted from multipolygons) ({expected_bytes} bytes of text left out)"
             )
         );
 
@@ -1899,7 +1899,7 @@ pub(crate) mod tests {
             .iter()
             .find(|m| m.loss == Some(crate::loss::LossCode::DroppedOverLimit))
             .expect("node cap notice must be emitted");
-        assert!(note.contains("9 tagged nodes (tags dropped in points)"), "{note:?}");
+        assert!(note.contains("9 tagged nodes (left out of points)"), "{note:?}");
         assert!(!note.contains("tagged way") && !note.contains("relation"), "{note:?}");
     }
 }
