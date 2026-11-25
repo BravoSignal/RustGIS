@@ -1581,7 +1581,10 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
             ),
         )),
         Offer::Coverage(c) => {
-            let anonymous = capability_crossed || crosses_origin(source, &c.endpoint) || s.web_logins.is_anonymous();
+            let anonymous = capability_crossed
+                || crosses_origin(source, &c.endpoint)
+                || s.web_logins.is_anonymous()
+                || super::b(p, "anonymous") == Some(true);
             let (get, _, _, asked) = match ps(p, "describe") {
                 // A plugin's command: its description read off the frame, as its documents are.
                 None if leaving => {
@@ -1654,7 +1657,7 @@ fn add_discovered(s: &mut Session, p: &Value, url: &str, want: &str, found: &Dis
                 let from = asked.as_deref().unwrap_or(items);
                 let crossed = capability_crossed || crosses_origin(source, from);
                 let from = if crossed { crate::render::rustgis_tiles::logins::inner(from) } else { from };
-                let anonymous = crossed || s.web_logins.is_anonymous();
+                let anonymous = crossed || s.web_logins.is_anonymous() || super::b(p, "anonymous") == Some(true);
                 crate::service_logins::anonymously(s, anonymous, |s| {
                     // An area request keeps the view until the requested box is applied below.
                     let keep_view = asked.is_some().then_some(false);

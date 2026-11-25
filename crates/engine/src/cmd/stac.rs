@@ -1443,6 +1443,7 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
                 ));
             }
         }
+        let anonymous = s.web_logins.is_anonymous() || b(p, "anonymous") == Some(true);
         // A range from the files themselves: one for every date and tile, as a range given is.
         let mut sampled = None;
         let range = if !auto {
@@ -1458,7 +1459,7 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
             ));
             None
         } else {
-            match sample_range(&tiles, &scales, scale, &nodata) {
+            match sample_range(&tiles, &scales, scale, &nodata, anonymous) {
                 Ok(Sample::Range(r)) => {
                     sampled = Some(r);
                     Some((r[0], r[1]))
@@ -1519,7 +1520,11 @@ fn add_cube(s: &mut Session, p: &Value) -> CmdResult {
             let urls: Vec<(f64, String)> = by_day.iter().map(|(d, u)| (*d as f64 * 86_400_000.0, format!("{u}{look}"))).collect();
             let Some((_, first)) = urls.first() else { continue };
             let name = if many { format!("{base} {tile}") } else { base.clone() };
-            let r = match super::layer::add_url(s, &json!({"url": first, "name": name, "cube": true, "connection": p.get("connection")})) {
+            let mut add = json!({"url": first, "name": name, "cube": true, "connection": p.get("connection")});
+            if anonymous {
+                add["anonymous"] = json!(true);
+            }
+            let r = match super::layer::add_url(s, &add) {
                 Ok(r) => r,
                 Err(e) => {
                     undo(s);
@@ -1663,6 +1668,7 @@ fn sample_range(
     scales: &std::collections::HashMap<String, (f64, f64)>,
     scale: Option<(f64, f64)>,
     nodata: &std::collections::HashMap<String, Vec<f64>>,
+    anonymous: bool,
 ) -> Result<Sample, String> {
     use crate::render::rustgis_tiles::{cog, cubes};
     let newest: Vec<&String> = tiles.values().filter_map(|by_day| by_day.values().next_back()).collect();
@@ -1670,7 +1676,8 @@ fn sample_range(
     let picked: Vec<&String> = (0..n.min(SAMPLE_FILES)).filter_map(|i| newest.get(i * n / n.min(SAMPLE_FILES))).copied().collect();
     let mut values = Vec::new();
     for href in picked {
-        let info = cog::info_blocking(href)?;
+        let fetch_href = crate::service_logins::fetch_url(anonymous, href);
+        let info = cog::info_blocking(&fetch_href)?;
         let l = &info.layout;
         if l.palette.is_some() {
             return Ok(Sample::Classes);
@@ -1681,7 +1688,7 @@ fn sample_range(
         };
         let (w, h) = (lv.width.min(SAMPLE_SIDE), lv.height.min(SAMPLE_SIDE));
         let (c0, r0) = ((lv.width - w) / 2, (lv.height - h) / 2);
-        let read = cog::read_values_blocking(&info, href, level, 0, (c0, c0 + w), (r0, r0 + h))?;
+        let read = cog::read_values_blocking(&info, &fetch_href, level, 0, (c0, c0 + w), (r0, r0 + h))?;
         let (k, o) = scales.get(href).copied().or(scale).unwrap_or((1.0, 0.0));
         let fill: Vec<f32> = nodata.get(href).map(|f| f.iter().map(|v| *v as f32).collect()).unwrap_or_default();
         values.extend(read.into_iter().filter(|v| v.is_finite() && !fill.contains(v)).map(|v| f64::from(v) * k + o));
