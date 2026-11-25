@@ -86,7 +86,7 @@ const STOPS_PER_UNIT: u64 = 16;
 /// run ([`Refusal::PastRun`]) when below [`CSS_STEPS`]; `matched` is set to the steps it took,
 /// refused or not, which its length doesn't bound, for the run to be charged them.
 pub(super) fn read(text: &str, cap: u64, matched: &mut u64) -> Result<usvg::Tree, Refusal> {
-    let xml = roxmltree::ParsingOptions { allow_dtd: true, nodes_limit: XML_NODES, ..Default::default() };
+    let xml = roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: XML_NODES, ..Default::default() };
     let doc = roxmltree::Document::parse_with_options(text, xml).map_err(|e| match e {
         roxmltree::Error::NodesLimitReached => Refusal::TooNested,
         _ => Refusal::NotSvg,
@@ -1120,6 +1120,12 @@ mod tests {
         assert_eq!(read("not xml").err(), Some(Refusal::NotSvg));
         let laughs = r#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;"><!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;"><!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;"><!ENTITY e "&d;&d;&d;&d;&d;&d;&d;&d;&d;&d;"><!ENTITY f "&e;&e;&e;&e;&e;&e;&e;&e;&e;&e;"><!ENTITY g "&f;&f;&f;&f;&f;&f;&f;&f;&f;&f;">]><svg xmlns="http://www.w3.org/2000/svg"><desc>&g;</desc></svg>"#;
         assert_eq!(read(laughs).err(), Some(Refusal::NotSvg));
+        // Any internal DTD entity subset is refused outright (allow_dtd: false).
+        let entity = r#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY sz "10">]><svg xmlns="http://www.w3.org/2000/svg"><rect width="&sz;" height="&sz;"/></svg>"#;
+        assert_eq!(read(entity).err(), Some(Refusal::NotSvg));
+        // Plain DOCTYPE without an internal subset behaves cleanly without panicking.
+        let plain_doctype = r#"<?xml version="1.0"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>"#;
+        let _ = read(plain_doctype);
         // The same in an attribute's value, quickly.
         let started = std::time::Instant::now();
         assert_eq!(read(&laughs.replace("<desc>&g;</desc>", r#"<path d="&g;"/>"#)).err(), Some(Refusal::NotSvg));
