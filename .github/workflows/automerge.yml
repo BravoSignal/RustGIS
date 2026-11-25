@@ -3,7 +3,9 @@ name: Auto-merge
 # A maintainer labels a pull request `automerge`: it's approved and joins the merge queue as soon
 # as the checks the `main` ruleset requires pass; the queue squash-merges it once its checks pass
 # on top of main. A later push drops the label and turns auto-merge off,
-# so new commits need another look; removing the label turns it off and dismisses the approval too.
+# so new commits need another look; removing the label turns it off and dismisses the approval
+# automerge posted (manual approvals and approvals created before this workflow marks them are
+# left untouched).
 #
 # `pull_request_target` so fork pull requests get the token; the pull request's code is never
 # checked out or run. The token is a maintainer's (`AUTOMERGE_TOKEN`), not GITHUB_TOKEN: Actions
