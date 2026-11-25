@@ -772,6 +772,19 @@ impl Search {
 pub const MAX_POINTS: usize = 1_000_000;
 const MAX_TRIES: usize = 50_000_000;
 
+/// Whether `e` is a finite, positive-area bounding box that [`random_points`] can sample inside.
+pub fn usable_polygon_extent(e: rustgis_geom::Extent) -> bool {
+    !e.is_empty()
+        && e.min_x.is_finite()
+        && e.max_x.is_finite()
+        && e.min_y.is_finite()
+        && e.max_y.is_finite()
+        && e.width().is_finite()
+        && e.height().is_finite()
+        && e.width() > 0.0
+        && e.height() > 0.0
+}
+
 /// Points spread at random (but reproducibly, from `seed`) inside polygons: `per` in each, up to
 /// [`MAX_POINTS`] in all; thin polygons may get fewer (tries are bounded too).
 pub fn random_points(ds: &Dataset, rows: &[usize], per: usize, seed: u64) -> Vec<(usize, Coord)> {
@@ -792,16 +805,7 @@ pub fn random_points(ds: &Dataset, rows: &[usize], per: usize, seed: u64) -> Vec
         crate::control::reached(i);
         let Some(Geometry::Polygon(polys)) = ds.features.get(*r).and_then(|f| f.geometry.as_ref()) else { continue };
         let e = ds.features.get(*r).and_then(|f| f.geometry.as_ref()).map(|g| g.extent()).unwrap_or_default();
-        if e.is_empty()
-            || !e.min_x.is_finite()
-            || !e.max_x.is_finite()
-            || !e.min_y.is_finite()
-            || !e.max_y.is_finite()
-            || !e.width().is_finite()
-            || !e.height().is_finite()
-            || e.width() <= 0.0
-            || e.height() <= 0.0
-        {
+        if !usable_polygon_extent(e) {
             continue;
         }
         let mut placed = 0;

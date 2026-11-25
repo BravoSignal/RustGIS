@@ -485,15 +485,33 @@ pub fn train(
     Ok(Trained { model, accuracy, samples: samples.len(), epochs, epochs_asked, fitted: fit.len(), training })
 }
 
+/// Result of classifying a raster: 1-based class numbers (`nodata` where a band has no data or
+/// where the network overflowed), each pixel's probability of that class, and how many valid
+/// pixels overflowed to non-finite probabilities and were left as `nodata`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Classified {
+    pub class: Vec<f32>,
+    pub prob: Vec<f32>,
+    pub overflowed: usize,
+}
+
 /// Classifies every pixel: class numbers (1-based, `nodata` where a band has no data) and each
 /// pixel's probability of that class. Rows go on several threads when the work is large, except in
 /// the browser, which uses one (#1252).
 pub fn classify(r: &Raster, model: &Mlp, nodata: f32) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let out = classify_on(r, model, nodata, None)?;
+    Ok((out.class, out.prob))
+}
+
+/// Like [`classify`], and also counts valid pixels whose values overflowed the network to
+/// non-finite probabilities and were left as `nodata`.
+pub fn classify_reporting(r: &Raster, model: &Mlp, nodata: f32) -> Result<Classified, String> {
     classify_on(r, model, nodata, None)
 }
 
-/// [`classify`] on `threads` threads (none: as many as pay off).
-fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> Result<(Vec<f32>, Vec<f32>), String> {
+/// [`classify_reporting`] on `threads` threads (none: as many as pay off).
+fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> Result<Classified, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     model.validate()?;
     // A large model on a large raster is refused rather than run for minutes, unless the run can
     // be cancelled.
@@ -509,6 +527,7 @@ fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> 
     }
     let (w, h) = (r.width as usize, r.height as usize);
     let (mut class, mut prob) = (crate::rasterops::new_band(w, h, nodata)?, crate::rasterops::new_band(w, h, nodata)?);
+    let overflowed = AtomicUsize::new(0);
     // In [`crate::parallel::MIN_ROW_WORK`]'s units (about 30 ns each): a weight of a pixel costs
     // about 1 ns.
     let work = w.saturating_mul(h).saturating_mul(weights) / 30;
@@ -520,6 +539,7 @@ fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> 
         threads,
         || (vec![0.0f32; model.bands.len()], crate::control::Pace::default()),
         |(x, pace): &mut (Vec<f32>, crate::control::Pace), row, (class, prob): (&mut [f32], &mut [f32])| {
+            let mut row_overflowed = 0usize;
             for (col, (c_out, p_out)) in class.iter_mut().zip(prob.iter_mut()).enumerate() {
                 // A large model on a wide row takes long without a cap: Cancel is looked at
                 // within it.
@@ -536,13 +556,20 @@ fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> 
                         None => false,
                     }
                 });
-                if ok && let Some((c, p)) = model.predict_checked(x) {
-                    (*c_out, *p_out) = ((c + 1) as f32, p);
+                if ok {
+                    if let Some((c, p)) = model.predict_checked(x) {
+                        (*c_out, *p_out) = ((c + 1) as f32, p);
+                    } else {
+                        row_overflowed += 1;
+                    }
                 }
+            }
+            if row_overflowed > 0 {
+                overflowed.fetch_add(row_overflowed, Ordering::Relaxed);
             }
         },
     )?;
-    Ok((class, prob))
+    Ok(Classified { class, prob, overflowed: overflowed.load(Ordering::Relaxed) })
 }
 
 #[cfg(test)]
@@ -612,12 +639,14 @@ mod tests {
         }
         let transform = GeoTransform { origin_x: 0.0, origin_y: 45.0, pixel_width: 0.001, pixel_height: -0.001 };
         let r = Raster::new("img", w, h, vec![a, b], transform, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
-        let (c1, p1) = classify_on(&r, &model, -1.0, Some(1)).unwrap();
+        let Classified { class: c1, prob: p1, overflowed } = classify_on(&r, &model, -1.0, Some(1)).unwrap();
+        assert_eq!(overflowed, 0);
         assert!(c1.contains(&1.0) && c1.contains(&2.0) && c1.contains(&-1.0), "both classes and no data");
         // A classified pixel has its class's probability; one with no data has none.
         assert!(c1.iter().zip(&p1).all(|(c, p)| if *c == -1.0 { *p == -1.0 } else { (0.0..=1.0).contains(p) && *p >= 0.5 }));
         for threads in [2, 7, 16] {
-            let (c, p) = classify_on(&r, &model, -1.0, Some(threads)).unwrap();
+            let Classified { class: c, prob: p, overflowed: ov } = classify_on(&r, &model, -1.0, Some(threads)).unwrap();
+            assert_eq!(ov, 0);
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!((bits(&c), bits(&p)), (bits(&c1), bits(&p1)), "{threads} threads");
         }
@@ -719,12 +748,17 @@ mod tests {
         model.validate().unwrap();
         let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
         let r = Raster::new("img", 2, 1, vec![vec![1.0, 1.0e38]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
-        let (class, prob) = classify(&r, &model, -1.0).unwrap();
+        let classified = classify_reporting(&r, &model, -1.0).unwrap();
+        let (class, prob) = (classified.class, classified.prob);
+        assert_eq!(classified.overflowed, 1, "one valid pixel overflowed the network");
         assert_eq!(model.predict_checked(&[1.0e38]), None);
         assert!(model.predict(&[1.0e38]).1.is_nan());
         assert_eq!(class[0], 1.0);
         assert!(prob[0] > 0.9 && prob[0].is_finite());
         assert_eq!(class[1], -1.0, "overflowing pixel stays nodata, got class {} prob {}", class[1], prob[1]);
         assert_eq!(prob[1], -1.0, "overflowing pixel stays nodata, got prob {}", prob[1]);
+
+        let clean = Raster::new("clean", 2, 1, vec![vec![1.0, -1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        assert_eq!(classify_reporting(&clean, &model, -1.0).unwrap().overflowed, 0);
     }
 }
