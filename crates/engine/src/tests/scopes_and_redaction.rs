@@ -1178,15 +1178,31 @@ fn project_log_scrubs_active_logins_and_s3_wrappers() {
     assert!(!logged.contains("rustgis-s3:"), "log_params leaked s3 wrapper: {logged}");
     assert!(!logged.contains(&s3_tok), "log_params leaked wrapped query token: {logged}");
 
-    // Deeply nested containers (depth >= 8) must still scrub active logins and S3 wrappers.
-    let mut deep = json!({ format!("k-{active_secret}"): format!("{active_secret} {wrapped}") });
+    // Deeply nested containers (depth >= 8) must omit contents so active logins (including ones
+    // with quotes or backslashes that JSON escaping would alter) and S3 wrappers cannot survive.
+    let quoted_secret = format!("pa\"ss\\word_{}", fixture_marker("deep_quoted"));
+    let conn2 = s
+        .run(
+            "connection.new",
+            &json!({"kind": "wms", "address": "https://log-scrub-quoted.example.org/wms", "auth": "header", "keyName": "X-Key"}),
+        )
+        .unwrap();
+    s.run("connection.login", &json!({"id": conn2["id"], "apiKey": quoted_secret})).unwrap();
+
+    let mut deep = json!({ format!("k-{active_secret}"): format!("{active_secret} {quoted_secret} {wrapped}") });
     for _ in 0..10 {
         deep = json!({"nested": [deep]});
     }
     let deep_logged = crate::log_params(&deep).into_log_value().to_string();
+    let escaped_quoted = serde_json::to_string(&quoted_secret).unwrap();
+    let escaped_inner = &escaped_quoted[1..escaped_quoted.len() - 1];
     assert!(!deep_logged.contains(&active_secret), "deep log_params leaked active login: {deep_logged}");
+    assert!(!deep_logged.contains(&quoted_secret), "deep log_params leaked quoted login: {deep_logged}");
+    assert!(!deep_logged.contains(escaped_inner), "deep log_params leaked JSON-escaped quoted login: {deep_logged}");
     assert!(!deep_logged.contains("rustgis-s3:"), "deep log_params leaked s3 wrapper: {deep_logged}");
     assert!(!deep_logged.contains(&s3_tok), "deep log_params leaked wrapped token: {deep_logged}");
+    let (kept_deep, partial) = crate::project_log::kept_and_partial(&deep);
+    assert!(partial, "deeply nested omitted container must mark params partial: {kept_deep}");
 
     // Failed command errors recorded in the session log must also scrub active logins and wrappers.
     let _ = s.run("layer.rename", &json!({"layer": format!("missing {active_secret} {wrapped}")}));

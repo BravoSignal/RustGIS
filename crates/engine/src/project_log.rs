@@ -201,8 +201,9 @@ fn redacted(v: &Value) -> Value {
     scrub_log_value(crate::cmd::history::redacted(&embedded_redacted(v, 0)), 0)
 }
 
-/// Removes active login values and runtime capability wrappers from every string and object key
-/// retained in log parameters.
+/// Removes active login values and runtime capability wrappers from strings and object keys
+/// retained in log parameters. Containers nested to depth 8 or deeper are omitted rather than
+/// serialized so JSON escaping cannot disguise an active credential.
 fn scrub_log_text(t: &str) -> String {
     crate::render::rustgis_tiles::logins::scrub(&crate::sources::scrub_s3_wrappers(t))
 }
@@ -214,7 +215,7 @@ fn scrub_log_value(v: Value, depth: usize) -> Value {
         Value::Object(o) if depth < 8 => {
             Value::Object(o.into_iter().map(|(k, x)| (scrub_log_text(&k), scrub_log_value(x, depth + 1))).collect())
         }
-        container @ (Value::Array(_) | Value::Object(_)) => Value::String(scrub_log_text(&container.to_string())),
+        Value::Array(_) | Value::Object(_) => Value::String("[omitted: nested too deeply]".into()),
         other => other,
     }
 }
