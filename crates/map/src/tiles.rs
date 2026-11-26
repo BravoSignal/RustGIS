@@ -81,7 +81,10 @@ impl TileKind {
             TileKind::MbTiles
         } else if path.ends_with(".pbf") || path.ends_with(".mvt") || path.contains("/{z}/{x}/{y}.vector") {
             TileKind::Vector
-        } else if path.ends_with("style.json") || (path.contains("/styles/") && !path.contains("{z}")) {
+        } else if path.ends_with("style.json")
+            || (path.contains("/styles/") && !path.contains("{z}"))
+            || (path.ends_with(".json") && is_local_style(url))
+        {
             TileKind::Style
         } else {
             TileKind::Raster
@@ -554,11 +557,14 @@ impl TileLayer {
         self.time_urls.dedup_by(|a, b| a.0 == b.0);
         self.time_urls.truncate(MAX_TIME_URLS);
         repairs.addresses = dated - self.time_urls.len() - usize::from(self.time_url.is_some());
-        let local = matches!(self.kind, TileKind::PmTiles | TileKind::MbTiles) && is_local_archive(&self.url);
+        let style_file = self.kind == TileKind::Style && is_local_style(&self.url);
+        let local = style_file || (matches!(self.kind, TileKind::PmTiles | TileKind::MbTiles) && is_local_archive(&self.url));
         if let Some(name) = self.url.strip_prefix(UPLOAD).filter(|_| self.kind == TileKind::MbTiles) {
             if name.is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
                 return Err("an uploaded MBTiles file needs a name".into());
             }
+        } else if style_file {
+            check_path(&self.url, "json")?;
         } else if local {
             if self.error.is_none() {
                 check_path(&self.url, if self.kind == TileKind::MbTiles { "mbtiles" } else { "pmtiles" })?;
@@ -633,8 +639,20 @@ pub fn is_local_archive(url: &str) -> bool {
     !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("s3://"))
 }
 
-/// Whether an archive's file path may be read: absolute, a `.<ext>` file (`pmtiles`,
-/// `mbtiles`), no longer than 4096 bytes.
+/// Whether a MapLibre style's address is a file on this computer (#2388): a path from the root
+/// or a drive, or a `file://` address, rather than a web address. Anything else is judged as a web
+/// address, and refused as one.
+pub fn is_local_style(url: &str) -> bool {
+    if !is_local_archive(url) {
+        return false;
+    }
+    let p = url.strip_prefix("file://").unwrap_or(url);
+    let drive = p.as_bytes().get(1) == Some(&b':') && p.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+    url.starts_with("file://") || p.starts_with('/') || p.starts_with('\\') || drive
+}
+
+/// Whether an archive's or style's file path may be read: absolute, a `.<ext>` file (`pmtiles`,
+/// `mbtiles`, `json`), no longer than 4096 bytes.
 pub fn check_path(path: &str, ext: &str) -> Result<(), String> {
     let p = path.strip_prefix("file://").unwrap_or(path);
     if p.len() > 4096 || p.chars().any(char::is_control) {
@@ -777,6 +795,31 @@ mod tests {
             assert!(error.contains(reason), "{error}");
             assert!(!error.contains("secret") && !error.contains("value"), "{error}");
         }
+    }
+
+    /// A MapLibre style may be a `.json` file on this computer (#2388), given by its full path:
+    /// it is kept as a style, named after the file; a relative path, a network share or another
+    /// kind of file is refused.
+    #[test]
+    fn a_style_file_on_this_computer_is_kept_by_its_path() {
+        for path in ["/home/me/maps/topo.json", "C:\\Maps\\topo.json", "file:///home/me/maps/topo.json"] {
+            assert!(is_local_style(path), "{path}");
+            assert_eq!(TileKind::guess(path), TileKind::Style, "{path}");
+            let mut t = TileLayer::new("", TileKind::Style, path);
+            t.repair().unwrap();
+            assert_eq!(t.url, path);
+            // (A path's separators are this system's: a Windows path is named on Windows.)
+            if !path.starts_with("C:") || cfg!(windows) {
+                assert_eq!(t.name, "topo", "{path}");
+            }
+        }
+        for path in ["https://maps.test/style.json", "maps/topo.json", "rustgis-login:broken"] {
+            assert!(!is_local_style(path), "{path}");
+        }
+        for path in ["\\\\server\\share\\topo.json", "//server/share/topo.json", "/home/me/maps/topo.txt"] {
+            assert!(TileLayer::new("", TileKind::Style, path).repair().is_err(), "{path}");
+        }
+        assert!(TileLayer::new("", TileKind::Style, "maps/topo.json").repair().unwrap_err().contains("https://"));
     }
 
     #[test]
