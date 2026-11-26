@@ -74,6 +74,10 @@ impl TileKind {
     /// The kind an address most likely is, from how it looks.
     pub fn guess(url: &str) -> TileKind {
         let url = rustgis_data::login_address::inner(url);
+        // A file's name is the whole path: `#` and `?` are characters of it, not a fragment or query.
+        if is_local_style(url) && url.to_ascii_lowercase().ends_with(".json") {
+            return TileKind::Style;
+        }
         let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
         if path.ends_with(".pmtiles") {
             TileKind::PmTiles
@@ -81,10 +85,7 @@ impl TileKind {
             TileKind::MbTiles
         } else if path.ends_with(".pbf") || path.ends_with(".mvt") || path.contains("/{z}/{x}/{y}.vector") {
             TileKind::Vector
-        } else if path.ends_with("style.json")
-            || (path.contains("/styles/") && !path.contains("{z}"))
-            || (path.ends_with(".json") && is_local_style(url))
-        {
+        } else if path.ends_with("style.json") || (path.contains("/styles/") && !path.contains("{z}")) {
             TileKind::Style
         } else {
             TileKind::Raster
@@ -802,6 +803,9 @@ mod tests {
     /// kind of file is refused.
     #[test]
     fn a_style_file_on_this_computer_is_kept_by_its_path() {
+        // A `#` or `?` in a file's name is part of it, not a web address's fragment or query.
+        assert_eq!(TileKind::guess("/home/me/maps/day#night.json"), TileKind::Style);
+        assert_eq!(TileKind::guess("C:\\Maps\\what?.json"), TileKind::Style);
         for path in ["/home/me/maps/topo.json", "C:\\Maps\\topo.json", "file:///home/me/maps/topo.json"] {
             assert!(is_local_style(path), "{path}");
             assert_eq!(TileKind::guess(path), TileKind::Style, "{path}");

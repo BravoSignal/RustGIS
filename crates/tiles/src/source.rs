@@ -632,11 +632,18 @@ pub fn is_local_style(url: &str) -> bool {
 fn read_local_style(path: &str) -> Result<Value, String> {
     pmtiles::check_local_path(path, "a style file", &["json"])?;
     let p = path.strip_prefix("file://").unwrap_or(path);
+    let too_big = || format!("{p}: a style file is at most {} MB", MAX_LOCAL_STYLE >> 20);
     let len = std::fs::metadata(p).map_err(|e| format!("{p}: {e}"))?.len();
     if len > MAX_LOCAL_STYLE {
-        return Err(format!("{p}: a style file is at most {} MB", MAX_LOCAL_STYLE >> 20));
+        return Err(too_big());
     }
-    let text = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
+    // Read no more than the limit allows, however large the file has grown since it was measured.
+    let mut text = Vec::new();
+    let file = std::fs::File::open(p).map_err(|e| format!("{p}: {e}"))?;
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, MAX_LOCAL_STYLE + 1), &mut text).map_err(|e| format!("{p}: {e}"))?;
+    if text.len() as u64 > MAX_LOCAL_STYLE {
+        return Err(too_big());
+    }
     let doc: Value = serde_json::from_slice(&text).map_err(|e| format!("{p}: not a JSON document ({e})"))?;
     if !doc.is_object() {
         return Err(format!("{p}: a MapLibre style is a JSON object"));
@@ -991,7 +998,8 @@ mod tests {
         });
         let dir = std::env::temp_dir().join(format!("rustgis-local-style-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("topo 50k.json");
+        // A `#` in the name is part of it, not a fragment of an address.
+        let file = dir.join("topo #50k.json");
         let style = json!({
             "version": 8,
             "sources": {"v": {"type": "vector", "url": tilejson}},
