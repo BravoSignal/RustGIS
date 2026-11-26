@@ -1043,6 +1043,14 @@ mod tests {
         // A relative path is judged as a web address, and refused as one.
         assert!(!is_local_style("styles/topo.json"));
         assert!(matches!(resolve(&spec(Kind::Style, "styles/topo.json")), Resolve::Failed(_)));
+        // Windows reads mixed separators as a share too, and `C:topo.json` from the drive's current folder.
+        for path in ["/\\server\\share\\topo.json", "\\/server/share/topo.json", "file:///\\server\\share\\topo.json", "C:topo.json"] {
+            assert!(pmtiles::check_local_path(path, "a style file", &["json"]).is_err(), "{path}");
+            assert!(matches!(resolve(&spec(Kind::Style, path)), Resolve::Failed(_)), "{path}");
+        }
+        for path in ["C:\\Maps\\topo.json", "C:/Maps/topo.json", "/home/me/maps/topo.json"] {
+            assert!(pmtiles::check_local_path(path, "a style file", &["json"]).is_ok(), "{path}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

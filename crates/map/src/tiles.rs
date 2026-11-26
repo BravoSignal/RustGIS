@@ -659,10 +659,13 @@ pub fn check_path(path: &str, ext: &str) -> Result<(), String> {
     if p.len() > 4096 || p.chars().any(char::is_control) {
         return Err("the path is too long or has control characters".into());
     }
-    let windows_drive = p.as_bytes().get(1) == Some(&b':') && p.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
-    // Not a network share (\\server\share, or file://server/…), which a project could use to
-    // make Windows connect to another machine.
-    let share = p.starts_with("\\\\") || p.starts_with("//") || (path.starts_with("file://") && !p.starts_with('/'));
+    // A drive path starts at the drive's root: `C:topo.json` is relative to its current folder.
+    let windows_drive = p.as_bytes().get(1) == Some(&b':')
+        && p.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && matches!(p.as_bytes().get(2), Some(b'/' | b'\\'));
+    // Not a network share (\\server\share, /\server\share, or file://server/…), which a project
+    // could use to make Windows connect to another machine.
+    let share = is_share(p) || (path.starts_with("file://") && !p.starts_with('/'));
     if share || !(p.starts_with('/') || windows_drive) {
         return Err(format!("'{p}': give the full path of the archive on this computer"));
     }
@@ -670,6 +673,13 @@ pub fn check_path(path: &str, ext: &str) -> Result<(), String> {
         return Err(format!("'{p}' isn't a .{ext} file"));
     }
     Ok(())
+}
+
+/// Whether a path starts as a network share: two separators, `/` or `\` in any mix, which
+/// Windows reads as `\\server\share`.
+fn is_share(p: &str) -> bool {
+    let sep = |b: Option<&u8>| matches!(b, Some(b'/' | b'\\'));
+    sep(p.as_bytes().first()) && sep(p.as_bytes().get(1))
 }
 
 /// Whether `url` may be fetched: HTTP, HTTPS or S3, with a host, and no longer than 4096 bytes.
@@ -820,7 +830,16 @@ mod tests {
         for path in ["https://maps.test/style.json", "maps/topo.json", "rustgis-login:broken"] {
             assert!(!is_local_style(path), "{path}");
         }
-        for path in ["\\\\server\\share\\topo.json", "//server/share/topo.json", "/home/me/maps/topo.txt"] {
+        // Windows reads mixed separators as a share too, and `C:topo.json` from the drive's current folder.
+        for path in [
+            "\\\\server\\share\\topo.json",
+            "//server/share/topo.json",
+            "/\\server\\share\\topo.json",
+            "\\/server/share/topo.json",
+            "file:///\\server\\share\\topo.json",
+            "C:topo.json",
+            "/home/me/maps/topo.txt",
+        ] {
             assert!(TileLayer::new("", TileKind::Style, path).repair().is_err(), "{path}");
         }
         assert!(TileLayer::new("", TileKind::Style, "maps/topo.json").repair().unwrap_err().contains("https://"));
